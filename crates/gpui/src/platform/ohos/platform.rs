@@ -16,7 +16,7 @@ use crate::{
     Action, AnyWindowHandle, App, AppCell, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId,
     ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
     PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, PriorityQueueReceiver, Result as GpuiResult, Task, WindowAppearance, WindowParams,
+    PlatformWindow, PriorityQueueReceiver, Result as GpuiResult, RunnableVariant, Task, WindowAppearance, WindowParams,
 };
 use std::rc::Weak;
 

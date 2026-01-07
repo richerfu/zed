@@ -1,7 +1,6 @@
 use ohos_hilog_binding::hilog_warn;
 
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
 };
