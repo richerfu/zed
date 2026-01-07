@@ -25,6 +25,14 @@ fn main() {
             #[cfg(target_os = "windows")]
             windows::build();
         }
+        Ok("ohos") => {
+            // Setup NAPI build for OHOS if napi-build-ohos is available
+            // This is optional and only needed when building as a cdylib
+            #[cfg(all(target_env = "ohos", feature = "napi-ohos"))]
+            {
+                napi_build_ohos::setup();
+            }
+        }
         _ => (),
     };
 }

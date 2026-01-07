@@ -185,6 +185,27 @@ impl Application {
     {
         let this = self.0.clone();
         let platform = self.0.borrow().platform.clone();
+        
+        // On OHOS, we need to leak the Application to prevent it from being dropped
+        // because run_loop doesn't retain ownership
+        #[cfg(target_env = "ohos")]
+        {
+            use crate::platform::ohos::OhosPlatform;
+            if let Some(ohos_platform) = (&*platform as &dyn std::any::Any).downcast_ref::<OhosPlatform>() {
+                ohos_platform.set_gpui_app(Rc::downgrade(&this));
+            }
+            
+            // Leak the Application to prevent it from being dropped
+            // This is necessary because openharmony-ability's run_loop doesn't retain ownership
+            Box::leak(Box::new(self));
+        }
+        
+        #[cfg(not(target_env = "ohos"))]
+        {
+            // On other platforms, we don't need to leak
+            drop(self);
+        }
+        
         platform.run(Box::new(move || {
             let cx = &mut *this.borrow_mut();
             on_finish_launching(cx);
