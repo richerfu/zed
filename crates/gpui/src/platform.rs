@@ -2,7 +2,10 @@ mod app_menu;
 mod keyboard;
 mod keystroke;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "freebsd"),
+    not(target_env = "ohos")
+))]
 mod linux;
 
 #[cfg(target_os = "macos")]
@@ -11,6 +14,7 @@ mod mac;
 #[cfg(any(
     all(
         any(target_os = "linux", target_os = "freebsd"),
+        not(target_env = "ohos"),
         any(feature = "x11", feature = "wayland")
     ),
     all(target_os = "macos", feature = "macos-blade")
@@ -24,7 +28,7 @@ mod test;
 mod windows;
 
 #[cfg(target_env = "ohos")]
-mod ohos;
+pub(crate) mod ohos;
 
 #[cfg(all(
     feature = "screen-capture",
@@ -32,6 +36,7 @@ mod ohos;
         target_os = "windows",
         all(
             any(target_os = "linux", target_os = "freebsd"),
+            not(target_env = "ohos"),
             any(feature = "wayland", feature = "x11"),
         )
     )
@@ -76,7 +81,10 @@ pub use app_menu::*;
 pub use keyboard::*;
 pub use keystroke::*;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "freebsd"),
+    not(target_env = "ohos")
+))]
 pub(crate) use linux::*;
 #[cfg(target_os = "macos")]
 pub(crate) use mac::*;
@@ -88,7 +96,11 @@ pub(crate) use windows::*;
 #[cfg(target_env = "ohos")]
 pub(crate) use ohos::*;
 
-#[cfg(all(target_os = "linux", feature = "wayland"))]
+#[cfg(all(
+    target_os = "linux",
+    not(target_env = "ohos"),
+    feature = "wayland"
+))]
 pub use linux::layer_shell;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -104,7 +116,10 @@ pub(crate) fn current_platform(headless: bool) -> Rc<dyn Platform> {
     Rc::new(MacPlatform::new(headless))
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "freebsd"),
+    not(target_env = "ohos")
+))]
 pub(crate) fn current_platform(headless: bool) -> Rc<dyn Platform> {
     #[cfg(feature = "x11")]
     use anyhow::Context as _;
@@ -166,8 +181,10 @@ pub(crate) fn current_platform(_headless: bool) -> Rc<dyn Platform> {
     )
 }
 
+/// Set the OpenHarmonyApp instance for the GPUI platform.
+/// This should be called from the `#[ability]` function before initializing GPUI.
 #[cfg(target_env = "ohos")]
-pub(crate) fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
+pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
     use std::sync::{LazyLock, RwLock};
     static OHOS_APP: LazyLock<RwLock<Option<openharmony_ability::OpenHarmonyApp>>> = LazyLock::new(|| RwLock::new(None));
     *OHOS_APP.write().unwrap() = Some(app);
@@ -175,7 +192,10 @@ pub(crate) fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
 
 /// Return which compositor we're guessing we'll use.
 /// Does not attempt to connect to the given compositor
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "freebsd"),
+    not(target_env = "ohos")
+))]
 #[inline]
 pub fn guess_compositor() -> &'static str {
     if std::env::var_os("ZED_HEADLESS").is_some() {
@@ -306,9 +326,15 @@ pub(crate) trait Platform: 'static {
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
     fn write_to_clipboard(&self, item: ClipboardItem);
 
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "freebsd"),
+        not(target_env = "ohos")
+    ))]
     fn read_from_primary(&self) -> Option<ClipboardItem>;
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "freebsd"),
+        not(target_env = "ohos")
+    ))]
     fn write_to_primary(&self, item: ClipboardItem);
 
     #[cfg(target_os = "macos")]
@@ -853,6 +879,7 @@ impl AtlasKey {
     #[cfg_attr(
         all(
             any(target_os = "linux", target_os = "freebsd"),
+            not(target_env = "ohos"),
             not(any(feature = "x11", feature = "wayland"))
         ),
         allow(dead_code)
@@ -956,6 +983,7 @@ pub(crate) struct AtlasTextureId {
 #[cfg_attr(
     all(
         any(target_os = "linux", target_os = "freebsd"),
+        not(target_env = "ohos"),
         not(any(feature = "x11", feature = "wayland"))
     ),
     allow(dead_code)
@@ -989,6 +1017,7 @@ pub(crate) struct PlatformInputHandler {
 #[cfg_attr(
     all(
         any(target_os = "linux", target_os = "freebsd"),
+        not(target_env = "ohos"),
         not(any(feature = "x11", feature = "wayland"))
     ),
     allow(dead_code)
@@ -1017,7 +1046,10 @@ impl PlatformInputHandler {
     }
 
     #[cfg_attr(
-        any(target_os = "linux", target_os = "freebsd", target_os = "windows"),
+        all(
+            any(target_os = "linux", target_os = "freebsd", target_os = "windows"),
+            not(target_env = "ohos")
+        ),
         allow(dead_code)
     )]
     fn text_for_range(
@@ -1280,6 +1312,7 @@ pub struct WindowOptions {
 #[cfg_attr(
     all(
         any(target_os = "linux", target_os = "freebsd"),
+        not(target_env = "ohos"),
         not(any(feature = "x11", feature = "wayland"))
     ),
     allow(dead_code)
@@ -1292,28 +1325,61 @@ pub(crate) struct WindowParams {
     pub titlebar: Option<TitlebarOptions>,
 
     /// The kind of window to create
-    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    #[cfg_attr(
+        all(
+            any(target_os = "linux", target_os = "freebsd"),
+            not(target_env = "ohos")
+        ),
+        allow(dead_code)
+    )]
     pub kind: WindowKind,
 
     /// Whether the window should be movable by the user
-    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    #[cfg_attr(
+        all(
+            any(target_os = "linux", target_os = "freebsd"),
+            not(target_env = "ohos")
+        ),
+        allow(dead_code)
+    )]
     pub is_movable: bool,
 
     /// Whether the window should be resizable by the user
-    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    #[cfg_attr(
+        all(
+            any(target_os = "linux", target_os = "freebsd"),
+            not(target_env = "ohos")
+        ),
+        allow(dead_code)
+    )]
     pub is_resizable: bool,
 
     /// Whether the window should be minimized by the user
-    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    #[cfg_attr(
+        all(
+            any(target_os = "linux", target_os = "freebsd"),
+            not(target_env = "ohos")
+        ),
+        allow(dead_code)
+    )]
     pub is_minimizable: bool,
 
     #[cfg_attr(
-        any(target_os = "linux", target_os = "freebsd", target_os = "windows"),
+        all(
+            any(target_os = "linux", target_os = "freebsd", target_os = "windows"),
+            not(target_env = "ohos")
+        ),
         allow(dead_code)
     )]
     pub focus: bool,
 
-    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    #[cfg_attr(
+        all(
+            any(target_os = "linux", target_os = "freebsd"),
+            not(target_env = "ohos")
+        ),
+        allow(dead_code)
+    )]
     pub show: bool,
 
     #[cfg_attr(feature = "wayland", allow(dead_code))]
@@ -1413,7 +1479,11 @@ pub enum WindowKind {
 
     /// A Wayland LayerShell window, used to draw overlays or backgrounds for applications such as
     /// docks, notifications or wallpapers.
-    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    #[cfg(all(
+        target_os = "linux",
+        not(target_env = "ohos"),
+        feature = "wayland"
+    ))]
     LayerShell(layer_shell::LayerShellOptions),
 
     /// A window that appears on top of its parent window and blocks interaction with it
@@ -2004,7 +2074,13 @@ impl ClipboardString {
             .and_then(|m| serde_json::from_str(m).ok())
     }
 
-    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    #[cfg_attr(
+        all(
+            any(target_os = "linux", target_os = "freebsd"),
+            not(target_env = "ohos")
+        ),
+        allow(dead_code)
+    )]
     pub(crate) fn text_hash(text: &str) -> u64 {
         let mut hasher = SeaHasher::new();
         text.hash(&mut hasher);

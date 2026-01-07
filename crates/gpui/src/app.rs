@@ -190,10 +190,9 @@ impl Application {
         // because run_loop doesn't retain ownership
         #[cfg(target_env = "ohos")]
         {
-            use crate::platform::ohos::OhosPlatform;
-            if let Some(ohos_platform) = (&*platform as &dyn std::any::Any).downcast_ref::<OhosPlatform>() {
-                ohos_platform.set_gpui_app(Rc::downgrade(&this));
-            }
+            use crate::platform::ohos::set_gpui_app_weak;
+            // Set the gpui_app weak reference in the platform
+            set_gpui_app_weak(Rc::downgrade(&this));
             
             // Leak the Application to prevent it from being dropped
             // This is necessary because openharmony-ability's run_loop doesn't retain ownership
@@ -1112,14 +1111,20 @@ impl App {
 
     /// Reads data from the primary selection buffer.
     /// Only available on Linux.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "freebsd"),
+        not(target_env = "ohos")
+    ))]
     pub fn read_from_primary(&self) -> Option<ClipboardItem> {
         self.platform.read_from_primary()
     }
 
     /// Writes data to the primary selection buffer.
     /// Only available on Linux.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "freebsd"),
+        not(target_env = "ohos")
+    ))]
     pub fn write_to_primary(&self, item: ClipboardItem) {
         self.platform.write_to_primary(item)
     }

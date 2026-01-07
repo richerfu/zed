@@ -7418,6 +7418,7 @@ dependencies = [
  "objc",
  "objc2",
  "objc2-metal",
+ "ohos-hilog-binding",
  "oo7",
  "open",
  "openharmony-ability",
@@ -11076,6 +11077,21 @@ name = "ohos-display-sys"
 version = "0.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fe9e1bba4d94159d0a65f1b4e748c148d4bce7930912c424522693f1837dad77"
+
+[[package]]
+name = "ohos-hilog-binding"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "860d1e3c2c5e3217d819a16c815d2d4dcbc7610285d2612d08745a29c353a503"
+dependencies = [
+ "ohos-hilogs-sys",
+]
+
+[[package]]
+name = "ohos-hilogs-sys"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed07615005d0f8d7bcf901f89c8ff4870666a9bdb00382f588af383f40c160b7"
 
 [[package]]
 name = "ohos-ime-binding"

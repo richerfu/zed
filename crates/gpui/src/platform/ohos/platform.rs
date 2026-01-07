@@ -1,7 +1,10 @@
+#[cfg(target_env = "ohos")]
+use ohos_hilog_binding::{hilog_debug, hilog_info, hilog_warn};
+
 use std::{
     cell::RefCell,
     path::PathBuf,
-    rc::{Rc, Weak},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -13,8 +16,9 @@ use crate::{
     Action, AnyWindowHandle, App, AppCell, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId,
     ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
     PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result as GpuiResult, Task, WindowAppearance, WindowParams,
+    PlatformWindow, PriorityQueueReceiver, Result as GpuiResult, Task, WindowAppearance, WindowParams,
 };
+use std::rc::Weak;
 
 use super::{
     dispatcher::OhosDispatcher,
@@ -30,12 +34,23 @@ pub(crate) struct OhosPlatform {
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
     primary_display: Rc<OhosDisplay>,
-    gpui_app: RefCell<Option<Weak<AppCell>>>,
+    main_receiver: PriorityQueueReceiver<RunnableVariant>,
+}
+
+// Global storage for the gpui_app weak reference
+// Note: Using RefCell instead of RwLock because OHOS operations are on the main thread
+thread_local! {
+    static GPUI_APP: RefCell<Option<Weak<AppCell>>> = RefCell::new(None);
+}
+
+pub(crate) fn set_gpui_app_weak(app: Weak<AppCell>) {
+    GPUI_APP.with(|cell| *cell.borrow_mut() = Some(app));
 }
 
 impl OhosPlatform {
     pub(crate) fn new(app: OpenHarmonyApp) -> Result<Self> {
-        let dispatcher = Arc::new(OhosDispatcher::new());
+        let (main_sender, main_receiver) = PriorityQueueReceiver::new();
+        let dispatcher = Arc::new(OhosDispatcher::new(main_sender));
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
         let text_system = Arc::new(OhosTextSystem::new());
@@ -48,39 +63,76 @@ impl OhosPlatform {
             foreground_executor,
             text_system,
             primary_display,
-            gpui_app: RefCell::new(None),
+            main_receiver,
         })
     }
-
-    pub(crate) fn set_gpui_app(&self, app: Weak<AppCell>) {
-        *self.gpui_app.borrow_mut() = Some(app);
+    
+    fn run_foreground_tasks(&self) {
+        // Process GPUI tasks queued for the main thread
+        // Similar to Windows' run_foreground_task, but simpler since OHOS doesn't have message timeouts
+        let mut receiver = self.main_receiver.clone();
+        while let Ok(Some(runnable)) = receiver.try_pop() {
+            OhosDispatcher::execute_runnable(runnable);
+        }
     }
 
     fn handle_ohos_event(&self, event: &Event) {
-        if let Some(app_weak) = self.gpui_app.borrow().as_ref() {
+        hilog_debug!("OhosPlatform: Received event: {:?}", event);
+        
+        // First, process any GPUI tasks queued for the main thread
+        // This ensures tasks are processed in the run_loop, integrating GPUI with OpenHarmony's event loop
+        self.run_foreground_tasks();
+        
+        if let Some(app_weak) = GPUI_APP.with(|cell| cell.borrow().clone()) {
             if let Some(app) = app_weak.upgrade() {
-                let mut app_borrow = app.borrow_mut();
-                
-                // Convert OpenHarmony events to GPUI events
-                match event {
-                    Event::WindowRedraw { .. } => {
-                        // Request redraw for all windows
-                        app_borrow.refresh_windows();
+                // Use update() to ensure flush_effects() is called, which processes refresh_windows()
+                // This ensures event-driven rendering on OHOS - events drive rendering, not active polling
+                app.borrow_mut().update(|app| {
+                    // Handle platform-level events and trigger window refresh
+                    // On OHOS, rendering is event-driven, so we refresh windows on relevant events
+                    match event {
+                        Event::WindowRedraw { .. } => {
+                            hilog_debug!("OhosPlatform: WindowRedraw event - refreshing windows for event-driven render");
+                            app.refresh_windows();
+                        }
+                        Event::WindowResize(size) => {
+                            hilog_debug!("OhosPlatform: WindowResize event - size: {}x{}", size.width, size.height);
+                            // Window resize is handled by individual windows through their callbacks
+                            // Trigger a refresh to update the window
+                            app.refresh_windows();
+                        }
+                        Event::Input(_input_event) => {
+                            hilog_debug!("OhosPlatform: Input event received");
+                            // Input events are handled by windows through their callbacks
+                            // The callbacks are set up in Window::new
+                            // Input events may also require rendering, so refresh windows
+                            app.refresh_windows();
+                        }
+                        Event::GainedFocus => {
+                            hilog_debug!("OhosPlatform: GainedFocus event");
+                            app.refresh_windows();
+                        }
+                        Event::LostFocus => {
+                            hilog_debug!("OhosPlatform: LostFocus event");
+                            app.refresh_windows();
+                        }
+                        Event::ConfigChanged(..) => {
+                            hilog_debug!("OhosPlatform: ConfigChanged event");
+                            app.refresh_windows();
+                        }
+                        Event::WindowDestroy => {
+                            hilog_debug!("OhosPlatform: WindowDestroy event");
+                        }
+                        _ => {
+                            hilog_debug!("OhosPlatform: Unhandled event: {:?}", event);
+                        }
                     }
-                    Event::WindowResize { .. } => {
-                        // Window resize is handled by individual windows
-                        // We can trigger a refresh here
-                        app_borrow.refresh_windows();
-                    }
-                    Event::Input(_input_event) => {
-                        // Input events are handled by windows
-                        // This is a placeholder - actual input handling is done in OhosWindow
-                    }
-                    _ => {
-                        // Other events are handled by the platform or windows
-                    }
-                }
+                });
+            } else {
+                hilog_warn!("OhosPlatform: App weak reference could not be upgraded");
             }
+        } else {
+            hilog_warn!("OhosPlatform: No GPUI app weak reference found");
         }
     }
 }
@@ -199,7 +251,7 @@ impl Platform for OhosPlatform {
 
     fn open_url(&self, url: &str) {
         // Not supported on OHOS
-        log::warn!("open_url not supported on OHOS: {}", url);
+        hilog_warn!("open_url not supported on OHOS: {}", url);
     }
 
     fn on_open_urls(&self, _callback: Box<dyn FnMut(Vec<String>)>) {

@@ -41,14 +41,9 @@ impl PlatformDisplay for OhosDisplay {
     }
 
     fn bounds(&self) -> Bounds<Pixels> {
-        if let Some(native_window) = self.app.native_window() {
-            let width = native_window.width() as f32;
-            let height = native_window.height() as f32;
-            Bounds::new(point(px(0.0), px(0.0)), size(px(width), px(height)))
-        } else {
-            // Default bounds if window is not available
-            Bounds::new(point(px(0.0), px(0.0)), size(px(1080.0), px(1920.0)))
-        }
+        // Default bounds for OHOS display
+        // In a real implementation, this would query the actual display size
+        Bounds::new(point(px(0.0), px(0.0)), size(px(1080.0), px(1920.0)))
     }
 
     fn visible_bounds(&self) -> Bounds<Pixels> {

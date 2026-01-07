@@ -19,25 +19,19 @@
 //! not as an example. The `#[ability]` macro generates the necessary NAPI bindings
 //! for the ArkTS entry point.
 
-#[cfg(target_env = "ohos")]
 use gpui::{
     App, Application, Bounds, Context, SharedString, Window, WindowBounds, WindowOptions, div,
     prelude::*, px, rgb, size,
 };
 
-#[cfg(target_env = "ohos")]
 use openharmony_ability::OpenHarmonyApp;
-#[cfg(target_env = "ohos")]
-use openharmony_ability_derive::ability;
 
 // On non-OHOS platforms, we don't need these imports
 
-#[cfg(target_env = "ohos")]
 struct OhosHello {
     text: SharedString,
 }
 
-#[cfg(target_env = "ohos")]
 impl Render for OhosHello {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -94,11 +88,10 @@ impl Render for OhosHello {
     }
 }
 
-#[cfg(target_env = "ohos")]
-#[ability]
-fn openharmony_app(app: OpenHarmonyApp) {
+#[openharmony_ability_derive::ability]
+pub fn openharmony_app(app: OpenHarmonyApp) {
     // Set the OpenHarmonyApp instance so GPUI platform can access it
-    gpui::platform::set_ohos_app(app.clone());
+    gpui::set_ohos_app(app.clone());
     
     // Initialize and run GPUI application
     // The event loop is automatically integrated by the platform
@@ -122,12 +115,3 @@ fn openharmony_app(app: OpenHarmonyApp) {
         cx.activate(true);
     });
 }
-
-#[cfg(not(target_env = "ohos"))]
-fn main() {
-    println!("This example is only available on OpenHarmony OS (target_env = \"ohos\")");
-    println!("To build for OHOS, use: cargo build --target aarch64-unknown-linux-ohos --example ohos_hello");
-    println!();
-    println!("Note: On OHOS, this code should be in lib.rs, not main.rs, as it uses the #[ability] macro.");
-}
-

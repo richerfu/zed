@@ -1,7 +1,7 @@
-use std::{collections::HashMap, rc::Rc};
+use collections::HashMap;
 
 use crate::{
-    Key, KeybindingKeystroke, Keystroke, Keymap, Modifiers, PlatformKeyboardLayout,
+    KeybindingKeystroke, Keystroke, PlatformKeyboardLayout,
     PlatformKeyboardMapper,
 };
 

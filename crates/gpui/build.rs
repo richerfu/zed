@@ -11,7 +11,10 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(gles)");
 
     #[cfg(any(
-        not(any(target_os = "macos", target_os = "windows")),
+        all(
+            not(any(target_os = "macos", target_os = "windows")),
+            not(target_env = "ohos")
+        ),
         all(target_os = "macos", feature = "macos-blade")
     ))]
     check_wgsl_shaders();
@@ -38,7 +41,10 @@ fn main() {
 }
 
 #[cfg(any(
-    not(any(target_os = "macos", target_os = "windows")),
+    all(
+        not(any(target_os = "macos", target_os = "windows")),
+        not(target_env = "ohos")
+    ),
     all(target_os = "macos", feature = "macos-blade")
 ))]
 fn check_wgsl_shaders() {

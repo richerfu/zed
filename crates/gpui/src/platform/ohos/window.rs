@@ -1,3 +1,6 @@
+#[cfg(target_env = "ohos")]
+use ohos_hilog_binding::{hilog_debug, hilog_info, hilog_warn};
+
 use std::{
     cell::RefCell,
     rc::Rc,
@@ -6,15 +9,15 @@ use std::{
 
 use anyhow::Result;
 use futures::channel::oneshot;
-use openharmony_ability::{Event, InputEvent, OpenHarmonyApp};
+use openharmony_ability::{Event, InputEvent, OpenHarmonyApp, Size as OhosSize};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use std::borrow::Cow;
 
 use crate::{
-    AnyWindowHandle, AtlasKey, AtlasTile, Bounds, Capslock, DevicePixels, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, ResizeEdge, Result, Scene, Size, WindowAppearance,
+    AnyWindowHandle, AtlasKey, AtlasTile, Bounds, Capslock, DevicePixels, GpuSpecs, Modifiers, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
+    PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
     WindowParams, px, point, size,
 };
@@ -79,28 +82,31 @@ impl OhosWindow {
         Ok(window)
     }
 
-    fn handle_event(&self, event: &Event) {
+    pub(crate) fn handle_event(&self, event: &Event) {
+        hilog_debug!("OhosWindow: Handling event: {:?}", event);
+        
         match event {
-            Event::WindowResize { .. } => {
-                if let Some(native_window) = self.app.native_window() {
-                    let width = native_window.width() as f32;
-                    let height = native_window.height() as f32;
-                    let new_size = size(px(width), px(height));
-                    *self.bounds.borrow_mut() = Bounds::new(
-                        self.bounds.borrow().origin,
-                        new_size,
-                    );
-                    if let Some(ref mut callback) = self.callbacks.borrow_mut().resize {
-                        callback(new_size, *self.scale.borrow());
-                    }
+            Event::WindowResize(ohos_size) => {
+                let width = ohos_size.width as f32;
+                let height = ohos_size.height as f32;
+                let new_size = size(px(width), px(height));
+                *self.bounds.borrow_mut() = Bounds::new(
+                    self.bounds.borrow().origin,
+                    new_size,
+                );
+                if let Some(ref mut callback) = self.callbacks.borrow_mut().resize {
+                    callback(new_size, *self.scale.borrow());
                 }
             }
             Event::WindowRedraw { .. } => {
+                hilog_debug!("OhosWindow: WindowRedraw event - requesting frame");
                 if let Some(ref mut callback) = self.callbacks.borrow_mut().request_frame {
                     callback(RequestFrameOptions {
                         require_presentation: true,
                         force_render: false,
                     });
+                } else {
+                    hilog_warn!("OhosWindow: WindowRedraw event but no request_frame callback set");
                 }
             }
             Event::Input(input_event) => {
@@ -116,7 +122,7 @@ impl OhosWindow {
                     callback(false);
                 }
             }
-            Event::ConfigChanged { .. } => {
+            Event::ConfigChanged(..) => {
                 let new_scale = self.app.scale() as f32;
                 *self.scale.borrow_mut() = new_scale;
                 if let Some(ref mut callback) = self.callbacks.borrow_mut().resize {
@@ -149,8 +155,8 @@ impl OhosWindow {
 impl HasWindowHandle for OhosWindow {
     fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
         if let Some(native_window) = self.app.native_window() {
-            if let Some(handle) = native_window.raw_window_handle() {
-                return Ok(handle);
+            if let Some(raw_handle) = native_window.raw_window_handle() {
+                return Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw_handle) });
             }
         }
         Err(raw_window_handle::HandleError::Unavailable)
@@ -159,9 +165,11 @@ impl HasWindowHandle for OhosWindow {
 
 impl HasDisplayHandle for OhosWindow {
     fn display_handle(&self) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
-        Ok(raw_window_handle::DisplayHandle::ohos(
-            raw_window_handle::OhosDisplayHandle::new(),
-        ))
+        // Create a dummy display handle for OHOS
+        // In a real implementation, this would come from the native window
+        let handle = raw_window_handle::OhosDisplayHandle::new();
+        let raw_handle = raw_window_handle::RawDisplayHandle::Ohos(handle);
+        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(raw_handle) })
     }
 }
 
@@ -210,7 +218,7 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn capslock(&self) -> Capslock {
-        Capslock::Off
+        Capslock::default()
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
@@ -268,7 +276,19 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
-        self.callbacks.borrow_mut().request_frame = Some(callback);
+        hilog_debug!("OhosWindow: on_request_frame callback set");
+        let mut callbacks = self.callbacks.borrow_mut();
+        callbacks.request_frame = Some(callback);
+        
+        // Request an initial frame to ensure the window renders immediately
+        // This is important because on OHOS, we might not receive a WindowRedraw event immediately
+        if let Some(ref mut cb) = callbacks.request_frame {
+            hilog_debug!("OhosWindow: Requesting initial frame");
+            cb(RequestFrameOptions {
+                require_presentation: true,
+                force_render: true,
+            });
+        }
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> crate::DispatchEventResult>) {
@@ -307,8 +327,32 @@ impl PlatformWindow for OhosWindow {
         self.callbacks.borrow_mut().appearance_changed = Some(callback);
     }
 
-    fn draw(&self, _scene: &Scene) {
-        // Rendering is handled by the graphics backend
+    fn draw(&self, scene: &Scene) {
+        let batch_count = scene.batches().count();
+        hilog_debug!("OhosWindow: draw called with {} batches", batch_count);
+        
+        // TODO: Implement rendering for OHOS platform
+        // Currently, OHOS platform doesn't have a renderer implementation.
+        // The scene contains all the rendering primitives but we need to implement
+        // the actual rendering using OHOS native graphics APIs.
+        // 
+        // For now, we just log that drawing was requested.
+        // In a full implementation, this would:
+        // 1. Convert Scene primitives to OHOS native graphics calls
+        // 2. Use OHOS XComponent or similar APIs to render to the window
+        // 3. Handle textures, paths, quads, sprites, etc.
+        
+        hilog_info!("OhosWindow: draw called with {} batches (rendering not yet implemented)", batch_count);
+        
+        // Log some scene statistics for debugging
+        let bounds = self.bounds.borrow();
+        hilog_debug!(
+            "OhosWindow: Window bounds: {}x{}, scale: {}, batches: {}",
+            bounds.size.width.0,
+            bounds.size.height.0,
+            *self.scale.borrow(),
+            batch_count
+        );
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
