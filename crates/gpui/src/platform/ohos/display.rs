@@ -5,6 +5,7 @@ use openharmony_ability::OpenHarmonyApp;
 
 use crate::{Bounds, DisplayId, Pixels, PlatformDisplay, Result, Size, point, px, size};
 
+#[derive(Clone)]
 pub(crate) struct OhosDisplay {
     app: OpenHarmonyApp,
     id: DisplayId,

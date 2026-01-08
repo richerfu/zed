@@ -28,7 +28,7 @@ mod test;
 mod windows;
 
 #[cfg(target_env = "ohos")]
-pub(crate) mod ohos;
+mod ohos;
 
 #[cfg(all(
     feature = "screen-capture",
@@ -95,12 +95,10 @@ pub(crate) use windows::*;
 
 #[cfg(target_env = "ohos")]
 pub(crate) use ohos::*;
+#[cfg(target_env = "ohos")]
+pub use ohos::{set_gpui_app_weak, set_ohos_app_global};
 
-#[cfg(all(
-    target_os = "linux",
-    not(target_env = "ohos"),
-    feature = "wayland"
-))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos"), feature = "wayland"))]
 pub use linux::layer_shell;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -155,22 +153,8 @@ pub(crate) fn current_platform(_headless: bool) -> Rc<dyn Platform> {
 
 #[cfg(target_env = "ohos")]
 pub(crate) fn current_platform(_headless: bool) -> Rc<dyn Platform> {
-    use openharmony_ability::OpenHarmonyApp;
-    use std::sync::{LazyLock, RwLock};
-    
-    // On OHOS, the app should be provided via a global variable set by #[ability] macro
-    static OHOS_APP: LazyLock<RwLock<Option<OpenHarmonyApp>>> = LazyLock::new(|| RwLock::new(None));
-    
-    // Try to get the app from the global variable
-    let app = OHOS_APP.read().unwrap().clone().unwrap_or_else(|| {
-        // Fallback: create a default app instance if not set
-        // This should only happen during testing or if #[ability] hasn't been called yet
-        log::warn!("OpenHarmonyApp not set, using default instance. Make sure #[ability] macro is used.");
-        OpenHarmonyApp::new()
-    });
-    
     Rc::new(
-        OhosPlatform::new(app)
+        OhosPlatform::new()
             .inspect_err(|err| {
                 log::error!("Failed to initialize OHOS platform: {}", err);
             })
@@ -179,15 +163,6 @@ pub(crate) fn current_platform(_headless: bool) -> Rc<dyn Platform> {
                 panic!("Failed to initialize OHOS platform");
             }),
     )
-}
-
-/// Set the OpenHarmonyApp instance for the GPUI platform.
-/// This should be called from the `#[ability]` function before initializing GPUI.
-#[cfg(target_env = "ohos")]
-pub fn set_ohos_app(app: openharmony_ability::OpenHarmonyApp) {
-    use std::sync::{LazyLock, RwLock};
-    static OHOS_APP: LazyLock<RwLock<Option<openharmony_ability::OpenHarmonyApp>>> = LazyLock::new(|| RwLock::new(None));
-    *OHOS_APP.write().unwrap() = Some(app);
 }
 
 /// Return which compositor we're guessing we'll use.
@@ -1479,11 +1454,7 @@ pub enum WindowKind {
 
     /// A Wayland LayerShell window, used to draw overlays or backgrounds for applications such as
     /// docks, notifications or wallpapers.
-    #[cfg(all(
-        target_os = "linux",
-        not(target_env = "ohos"),
-        feature = "wayland"
-    ))]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos"), feature = "wayland"))]
     LayerShell(layer_shell::LayerShellOptions),
 
     /// A window that appears on top of its parent window and blocks interaction with it

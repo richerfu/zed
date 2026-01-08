@@ -1,39 +1,32 @@
-#[cfg(target_env = "ohos")]
-use ohos_hilog_binding::{hilog_debug, hilog_info, hilog_warn};
+use ohos_hilog_binding::{hilog_debug, hilog_warn};
 
-use std::{
-    cell::RefCell,
-    path::PathBuf,
-    rc::Rc,
-    sync::Arc,
-};
+use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc};
 
 use anyhow::Result;
 use futures::channel::oneshot;
-use openharmony_ability::{Event, InputEvent, OpenHarmonyApp};
+use openharmony_ability::{Event, OpenHarmonyApp};
 
 use crate::{
-    Action, AnyWindowHandle, App, AppCell, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId,
-    ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
+    Action, AnyWindowHandle, App, AppCell, BackgroundExecutor, ClipboardItem, CursorStyle,
+    DisplayId, ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
     PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, PriorityQueueReceiver, Result as GpuiResult, RunnableVariant, Task, WindowAppearance, WindowParams,
+    PlatformWindow, PriorityQueueReceiver, Result as GpuiResult, RunnableVariant, Task,
+    WindowAppearance, WindowParams,
 };
 use std::rc::Weak;
 
 use super::{
-    dispatcher::OhosDispatcher,
-    display::OhosDisplay,
-    text_system::OhosTextSystem,
+    dispatcher::OhosDispatcher, display::OhosDisplay, text_system::OhosTextSystem,
     window::OhosWindow,
 };
 
 pub(crate) struct OhosPlatform {
-    app: OpenHarmonyApp,
+    app: Rc<RefCell<Option<OpenHarmonyApp>>>,
     dispatcher: Arc<OhosDispatcher>,
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
-    primary_display: Rc<OhosDisplay>,
+    primary_display: Rc<RefCell<Option<OhosDisplay>>>,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
 }
 
@@ -43,30 +36,58 @@ thread_local! {
     static GPUI_APP: RefCell<Option<Weak<AppCell>>> = RefCell::new(None);
 }
 
-pub(crate) fn set_gpui_app_weak(app: Weak<AppCell>) {
+/// Set the GPUI app weak reference for OHOS platform.
+/// This allows the platform to access the app instance during Ability lifecycle execution.
+pub fn set_gpui_app_weak(app: Weak<AppCell>) {
     GPUI_APP.with(|cell| *cell.borrow_mut() = Some(app));
 }
 
+// Global storage for OpenHarmonyApp
+thread_local! {
+    static OHOS_APP: RefCell<Option<OpenHarmonyApp>> = RefCell::new(None);
+}
+
+/// Set the OpenHarmonyApp instance in global storage.
+/// This allows OhosPlatform to access the app instance when it's initialized.
+pub fn set_ohos_app_global(app: OpenHarmonyApp) {
+    OHOS_APP.with(|cell| *cell.borrow_mut() = Some(app));
+}
+
+pub(crate) fn get_ohos_app_global() -> Option<OpenHarmonyApp> {
+    OHOS_APP.with(|cell| cell.borrow().clone())
+}
+
 impl OhosPlatform {
-    pub(crate) fn new(app: OpenHarmonyApp) -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let (main_sender, main_receiver) = PriorityQueueReceiver::new();
         let dispatcher = Arc::new(OhosDispatcher::new(main_sender));
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
         let text_system = Arc::new(OhosTextSystem::new());
-        let primary_display = Rc::new(OhosDisplay::new(app.clone()));
 
         Ok(Self {
-            app,
+            app: Rc::new(RefCell::new(None)),
             dispatcher,
             background_executor,
             foreground_executor,
             text_system,
-            primary_display,
+            primary_display: Rc::new(RefCell::new(None)),
             main_receiver,
         })
     }
-    
+
+    pub(crate) fn set_app(&self, app: OpenHarmonyApp) {
+        *self.app.borrow_mut() = Some(app.clone());
+        // Initialize primary display when app is set
+        *self.primary_display.borrow_mut() = Some(OhosDisplay::new(app));
+    }
+
+    pub(crate) fn try_set_app_from_global(&self) {
+        if let Some(app) = get_ohos_app_global() {
+            self.set_app(app);
+        }
+    }
+
     fn run_foreground_tasks(&self) {
         // Process GPUI tasks queued for the main thread
         // Similar to Windows' run_foreground_task, but simpler since OHOS doesn't have message timeouts
@@ -78,25 +99,28 @@ impl OhosPlatform {
 
     fn handle_ohos_event(&self, event: &Event) {
         hilog_debug!("OhosPlatform: Received event: {:?}", event);
-        
+
         // First, process any GPUI tasks queued for the main thread
         // This ensures tasks are processed in the run_loop, integrating GPUI with OpenHarmony's event loop
         self.run_foreground_tasks();
-        
+
+        // Access GPUI App instance through global storage
         if let Some(app_weak) = GPUI_APP.with(|cell| cell.borrow().clone()) {
             if let Some(app) = app_weak.upgrade() {
-                // Use update() to ensure flush_effects() is called, which processes refresh_windows()
-                // This ensures event-driven rendering on OHOS - events drive rendering, not active polling
                 app.borrow_mut().update(|app| {
-                    // Handle platform-level events and trigger window refresh
-                    // On OHOS, rendering is event-driven, so we refresh windows on relevant events
                     match event {
                         Event::WindowRedraw { .. } => {
-                            hilog_debug!("OhosPlatform: WindowRedraw event - refreshing windows for event-driven render");
+                            hilog_debug!(
+                                "OhosPlatform: WindowRedraw event - refreshing windows for event-driven render"
+                            );
                             app.refresh_windows();
                         }
                         Event::WindowResize(size) => {
-                            hilog_debug!("OhosPlatform: WindowResize event - size: {}x{}", size.width, size.height);
+                            hilog_debug!(
+                                "OhosPlatform: WindowResize event - size: {}x{}",
+                                size.width,
+                                size.height
+                            );
                             // Window resize is handled by individual windows through their callbacks
                             // Trigger a refresh to update the window
                             app.refresh_windows();
@@ -151,36 +175,34 @@ impl Platform for OhosPlatform {
     }
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
-        // Call the launch callback first
-        on_finish_launching();
-        
-        // Leak the platform to prevent it from being dropped
-        // This is necessary because run_loop doesn't retain ownership
-        // The platform is held by Rc in Application, so leaking it here ensures
-        // it lives for the lifetime of the application
-        // SAFETY: The platform must live for the lifetime of the application
-        // Since Application is leaked in app.rs, the platform will also live
-        let platform_leaked: &'static Self = unsafe {
-            std::mem::transmute(self)
-        };
-        
-        // Start the OpenHarmony event loop (non-blocking)
-        // run_loop registers a callback and returns immediately
-        // This integrates the OpenHarmony event loop with GPUI
-        let app = self.app.clone();
-        
-        app.run_loop(move |event| {
-            // Handle events in the platform
-            // The platform is leaked, so it's safe to use here
-            platform_leaked.handle_ohos_event(&event);
-        });
-        
-        // run_loop returns immediately (non-blocking)
-        // The function returns here, allowing #[ability] to return
+        // Try to get app from global storage if not already set
+        if self.app.borrow().is_none() {
+            self.try_set_app_from_global();
+        }
+
+        let platform = self as *const Self;
+        let mut on_finish = Some(on_finish_launching);
+        if let Some(app) = self.app.borrow().clone() {
+            app.run_loop(move |event: Event| match event {
+                Event::SurfaceCreate { .. } => {
+                    if let Some(callback) = on_finish.take() {
+                        callback();
+                    }
+                }
+                _ => unsafe {
+                    let platform: &Self = &*platform;
+                    platform.handle_ohos_event(&event);
+                },
+            });
+        } else {
+            hilog_warn!("OhosPlatform: App not set");
+        }
     }
 
     fn quit(&self) {
-        self.app.exit(0);
+        if let Some(app) = self.app.borrow_mut().clone() {
+            app.exit(0);
+        }
     }
 
     fn restart(&self, _binary_path: Option<PathBuf>) {
@@ -204,11 +226,18 @@ impl Platform for OhosPlatform {
     }
 
     fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>> {
-        vec![self.primary_display.clone()]
+        if let Some(display) = self.primary_display.borrow().as_ref() {
+            vec![Rc::new(display.clone()) as Rc<dyn PlatformDisplay>]
+        } else {
+            vec![]
+        }
     }
 
     fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
-        Some(self.primary_display.clone())
+        self.primary_display
+            .borrow()
+            .as_ref()
+            .map(|d| Rc::new(d.clone()) as Rc<dyn PlatformDisplay>)
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
@@ -238,11 +267,15 @@ impl Platform for OhosPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
-        Ok(Box::new(OhosWindow::new(
-            self.app.clone(),
-            handle,
-            options,
-        )?))
+        if self.app.borrow().is_some() {
+            Ok(Box::new(OhosWindow::new(
+                self.app.clone(),
+                handle,
+                options,
+            )?))
+        } else {
+            Err(anyhow::anyhow!("OpenHarmonyApp not set"))
+        }
     }
 
     fn window_appearance(&self) -> WindowAppearance {
@@ -259,7 +292,9 @@ impl Platform for OhosPlatform {
     }
 
     fn register_url_scheme(&self, _url: &str) -> Task<Result<()>> {
-        Task::ready(Err(anyhow::anyhow!("URL scheme registration not supported on OHOS")))
+        Task::ready(Err(anyhow::anyhow!(
+            "URL scheme registration not supported on OHOS"
+        )))
     }
 
     fn prompt_for_paths(
@@ -334,7 +369,9 @@ impl Platform for OhosPlatform {
     }
 
     fn path_for_auxiliary_executable(&self, _name: &str) -> Result<PathBuf> {
-        Err(anyhow::anyhow!("path_for_auxiliary_executable not available on OHOS"))
+        Err(anyhow::anyhow!(
+            "path_for_auxiliary_executable not available on OHOS"
+        ))
     }
 
     fn set_cursor_style(&self, _style: CursorStyle) {
@@ -355,7 +392,9 @@ impl Platform for OhosPlatform {
     }
 
     fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
-        Task::ready(Err(anyhow::anyhow!("Credential storage not supported on OHOS")))
+        Task::ready(Err(anyhow::anyhow!(
+            "Credential storage not supported on OHOS"
+        )))
     }
 
     fn read_credentials(&self, _url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
@@ -363,7 +402,9 @@ impl Platform for OhosPlatform {
     }
 
     fn delete_credentials(&self, _url: &str) -> Task<Result<()>> {
-        Task::ready(Err(anyhow::anyhow!("Credential deletion not supported on OHOS")))
+        Task::ready(Err(anyhow::anyhow!(
+            "Credential deletion not supported on OHOS"
+        )))
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
@@ -378,4 +419,3 @@ impl Platform for OhosPlatform {
         // Not supported on OHOS
     }
 }
-

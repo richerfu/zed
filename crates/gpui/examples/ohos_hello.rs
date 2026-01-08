@@ -90,12 +90,10 @@ impl Render for OhosHello {
 
 #[openharmony_ability_derive::ability]
 pub fn openharmony_app(app: OpenHarmonyApp) {
-    // Set the OpenHarmonyApp instance so GPUI platform can access it
-    gpui::set_ohos_app(app.clone());
     
     // Initialize and run GPUI application
     // The event loop is automatically integrated by the platform
-    Application::new().run(|cx: &mut App| {
+    Application::new().with_ohos_app(app.clone()).run(|cx: &mut App| {
         let default_size = size(px(800.0), px(600.0));
         let bounds = Bounds::centered(None, default_size, cx);
         

@@ -177,6 +177,17 @@ impl Application {
         self
     }
 
+    /// Set the OpenHarmonyApp instance for OHOS platform.
+    /// This should be called before `run()` to ensure the app is available when the platform initializes.
+    #[cfg(target_env = "ohos")]
+    pub fn with_ohos_app(self, app: openharmony_ability::OpenHarmonyApp) -> Self {
+        // Store the app in a global location that OhosPlatform can access
+        // This is a workaround since we can't easily downcast Rc<dyn Platform>
+        use crate::platform::set_ohos_app_global;
+        set_ohos_app_global(app);
+        self
+    }
+
     /// Start the application. The provided callback will be called once the
     /// app is fully launched.
     pub fn run<F>(self, on_finish_launching: F)
@@ -184,31 +195,25 @@ impl Application {
         F: 'static + FnOnce(&mut App),
     {
         let this = self.0.clone();
-        let platform = self.0.borrow().platform.clone();
         
-        // On OHOS, we need to leak the Application to prevent it from being dropped
-        // because run_loop doesn't retain ownership
         #[cfg(target_env = "ohos")]
         {
-            use crate::platform::ohos::set_gpui_app_weak;
-            // Set the gpui_app weak reference in the platform
+            // Set the GPUI app weak reference before running the platform
+            // This ensures handle_ohos_event can access the app instance when Ability lifecycle events fire
+            use crate::platform::set_gpui_app_weak;
             set_gpui_app_weak(Rc::downgrade(&this));
-            
-            // Leak the Application to prevent it from being dropped
-            // This is necessary because openharmony-ability's run_loop doesn't retain ownership
-            Box::leak(Box::new(self));
         }
         
-        #[cfg(not(target_env = "ohos"))]
-        {
-            // On other platforms, we don't need to leak
-            drop(self);
-        }
-        
+        let platform = this.borrow().platform.clone();
         platform.run(Box::new(move || {
             let cx = &mut *this.borrow_mut();
             on_finish_launching(cx);
         }));
+
+        #[cfg(target_env = "ohos")]
+        {
+            _ = Box::leak(Box::new(self));
+        }
     }
 
     /// Register a handler to be invoked when the platform instructs the application
