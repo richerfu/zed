@@ -17,7 +17,8 @@ mod mac;
         not(target_env = "ohos"),
         any(feature = "x11", feature = "wayland")
     ),
-    all(target_os = "macos", feature = "macos-blade")
+    all(target_os = "macos", feature = "macos-blade"),
+    target_env = "ohos"
 ))]
 mod blade;
 

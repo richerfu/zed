@@ -11,12 +11,14 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::borrow::Cow;
 
 use crate::{
-    AnyWindowHandle, AtlasKey, AtlasTile, Bounds, Capslock, DevicePixels, GpuSpecs, Modifiers,
+    AnyWindowHandle, Bounds, Capslock, DevicePixels, GpuSpecs, Modifiers,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
     Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
     WindowDecorations, WindowParams, point, px, size,
 };
+use crate::platform::blade::{BladeContext, BladeRenderer, BladeSurfaceConfig};
+use blade_graphics as gpu;
 
 use super::display::OhosDisplay;
 
@@ -27,6 +29,7 @@ pub(crate) struct OhosWindow {
     scale: RefCell<f32>,
     input_handler: RefCell<Option<PlatformInputHandler>>,
     callbacks: RefCell<WindowCallbacks>,
+    renderer: RefCell<Option<BladeRenderer>>,
 }
 
 struct WindowCallbacks {
@@ -47,11 +50,29 @@ impl OhosWindow {
         app: Rc<RefCell<Option<OpenHarmonyApp>>>,
         handle: AnyWindowHandle,
         params: WindowParams,
+        gpu_context: &BladeContext,
     ) -> Result<Self> {
         let scale = app.borrow().as_ref().map(|a| a.scale() as f32).unwrap_or(1.0);
         let bounds = params.bounds;
 
-        // Set up event handling
+        // Create Blade renderer using raw window handle, same as Linux Wayland
+        let renderer = {
+            // The window implements HasWindowHandle and HasDisplayHandle
+            // We'll create a temporary reference for initialization
+            let config = BladeSurfaceConfig {
+                size: gpu::Extent {
+                    width: bounds.size.width.0 as u32,
+                    height: bounds.size.height.0 as u32,
+                    depth: 1,
+                },
+                transparent: true,
+            };
+            
+            // We need to create the renderer after the window struct is created
+            // So we'll initialize it as None first and create it lazily
+            None
+        };
+
         let window = Self {
             app: app.clone(),
             handle,
@@ -70,13 +91,29 @@ impl OhosWindow {
                 appearance_changed: None,
                 hit_test_window_control: None,
             }),
+            renderer: RefCell::new(renderer),
         };
+
+        // Initialize renderer now that we have a valid window reference
+        let config = BladeSurfaceConfig {
+            size: gpu::Extent {
+                width: bounds.size.width.0 as u32,
+                height: bounds.size.height.0 as u32,
+                depth: 1,
+            },
+            transparent: true,
+        };
+        
+        let renderer = BladeRenderer::new(gpu_context, &window, config)
+            .map_err(|e| anyhow::anyhow!("Failed to create Blade renderer: {}", e))?;
+        *window.renderer.borrow_mut() = Some(renderer);
 
         // Event handling is managed by OpenHarmonyApp's run_loop
         // We'll set up callbacks when the window is actually used
 
         Ok(window)
     }
+    
 
     pub(crate) fn handle_event(&self, event: &Event) {
         hilog_debug!("OhosWindow: Handling event: {:?}", event);
@@ -87,6 +124,8 @@ impl OhosWindow {
                 let height = ohos_size.height as f32;
                 let new_size = size(px(width), px(height));
                 *self.bounds.borrow_mut() = Bounds::new(self.bounds.borrow().origin, new_size);
+                
+                
                 if let Some(ref mut callback) = self.callbacks.borrow_mut().resize {
                     callback(new_size, *self.scale.borrow());
                 }
@@ -151,8 +190,8 @@ impl HasWindowHandle for OhosWindow {
     ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
         if let Some(app) = self.app.borrow().as_ref() {
             if let Some(native_window) = app.native_window() {
-                if let Some(raw_handle) = native_window.raw_window_handle() {
-                    return Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw_handle) });
+            if let Some(raw_handle) = native_window.raw_window_handle() {
+                return Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw_handle) });
                 }
             }
         }
@@ -328,51 +367,37 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        // Simple rendering implementation for OHOS
+        // Currently, this is a placeholder that logs the draw call
+        // In the future, this could be implemented using OHOS native graphics APIs
+        // (e.g., using raw-window-handle to get the native window and render directly)
         let batch_count = scene.batches().count();
         hilog_debug!("OhosWindow: draw called with {} batches", batch_count);
-
-        // TODO: Implement rendering for OHOS platform
-        // Currently, OHOS platform doesn't have a renderer implementation.
-        // The scene contains all the rendering primitives but we need to implement
-        // the actual rendering using OHOS native graphics APIs.
-        //
-        // For now, we just log that drawing was requested.
-        // In a full implementation, this would:
-        // 1. Convert Scene primitives to OHOS native graphics calls
-        // 2. Use OHOS XComponent or similar APIs to render to the window
-        // 3. Handle textures, paths, quads, sprites, etc.
-
-        hilog_info!(
-            "OhosWindow: draw called with {} batches (rendering not yet implemented)",
-            batch_count
-        );
-
-        // Log some scene statistics for debugging
-        let bounds = self.bounds.borrow();
-        hilog_debug!(
-            "OhosWindow: Window bounds: {}x{}, scale: {}, batches: {}",
-            bounds.size.width.0,
-            bounds.size.height.0,
-            *self.scale.borrow(),
-            batch_count
-        );
+        
+        // TODO: Implement actual rendering using OHOS native graphics APIs
+        // The scene contains all the rendering primitives (paths, quads, sprites, etc.)
+        // but we need to convert them to OHOS native graphics calls
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
-        // TODO: Implement proper atlas
-        // For now, return a dummy implementation
-        struct DummyAtlas;
-        impl PlatformAtlas for DummyAtlas {
-            fn get_or_insert_with<'a>(
-                &self,
-                _key: &crate::AtlasKey,
-                _build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
-            ) -> Result<Option<crate::AtlasTile>> {
-                Ok(None)
+        // Use Blade renderer's atlas, same as Linux Wayland
+        if let Some(ref renderer) = *self.renderer.borrow() {
+            renderer.sprite_atlas().clone()
+        } else {
+            // Fallback to dummy atlas if renderer is not available
+            struct DummyAtlas;
+            impl PlatformAtlas for DummyAtlas {
+                fn get_or_insert_with<'a>(
+                    &self,
+                    _key: &crate::AtlasKey,
+                    _build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
+                ) -> Result<Option<crate::AtlasTile>> {
+                    Ok(None)
+                }
+                fn remove(&self, _key: &crate::AtlasKey) {}
             }
-            fn remove(&self, _key: &crate::AtlasKey) {}
+            Arc::new(DummyAtlas)
         }
-        Arc::new(DummyAtlas)
     }
 
     fn request_decorations(&self, _decorations: WindowDecorations) {
@@ -417,6 +442,7 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
+        // GPU specs not available without a renderer
         None
     }
 

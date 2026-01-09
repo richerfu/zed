@@ -19,6 +19,7 @@ use super::{
     dispatcher::OhosDispatcher, display::OhosDisplay, text_system::OhosTextSystem,
     window::OhosWindow,
 };
+use crate::platform::blade::BladeContext;
 
 pub(crate) struct OhosPlatform {
     app: Rc<RefCell<Option<OpenHarmonyApp>>>,
@@ -28,6 +29,7 @@ pub(crate) struct OhosPlatform {
     text_system: Arc<dyn PlatformTextSystem>,
     primary_display: Rc<RefCell<Option<OhosDisplay>>>,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
+    gpu_context: BladeContext,
 }
 
 // Global storage for the gpui_app weak reference
@@ -64,6 +66,18 @@ impl OhosPlatform {
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
         let text_system = Arc::new(OhosTextSystem::new());
+        
+        // Initialize GPU context for Blade renderer, same as Linux Wayland
+        // Note: ZED_DEVICE_ID environment variable is optional - if not set, device_id defaults to 0
+        let gpu_context = BladeContext::new()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create GPU context: {}. \
+                    Note: ZED_DEVICE_ID environment variable is optional. \
+                    If you need to specify a GPU device, set ZED_DEVICE_ID to a 4-digit hex PCI ID (e.g., '0x1234').",
+                    e
+                )
+            })?;
 
         Ok(Self {
             app: Rc::new(RefCell::new(None)),
@@ -73,6 +87,7 @@ impl OhosPlatform {
             text_system,
             primary_display: Rc::new(RefCell::new(None)),
             main_receiver,
+            gpu_context,
         })
     }
 
@@ -108,6 +123,7 @@ impl OhosPlatform {
         if let Some(app_weak) = GPUI_APP.with(|cell| cell.borrow().clone()) {
             if let Some(app) = app_weak.upgrade() {
                 app.borrow_mut().update(|app| {
+                    let s = format!("OhosPlatform: Handling event: {:?}", event);
                     match event {
                         Event::WindowRedraw { .. } => {
                             hilog_debug!(
@@ -272,6 +288,7 @@ impl Platform for OhosPlatform {
                 self.app.clone(),
                 handle,
                 options,
+                &self.gpu_context,
             )?))
         } else {
             Err(anyhow::anyhow!("OpenHarmonyApp not set"))
