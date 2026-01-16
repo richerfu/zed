@@ -168,7 +168,7 @@ pathfinder_geometry = "0.5"
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))'.dependencies]
 scap = { workspace = true, optional = true }
 
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+[target.'cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "freebsd"))'.dependencies]
 # Always used
 flume = "0.11"
 oo7 = { version = "0.5.0", default-features = false, features = [
@@ -248,9 +248,16 @@ openharmony-ability-derive = { path = "../../../../ohos-rs/openharmony-activity/
 napi-ohos = { version = "1.1" }
 napi-derive-ohos = { version = "1.1" }
 ohos-hilog-binding = "0.1.2"
+flume = "0.11"
+# Blade renderer dependencies for GLES backend
+blade-graphics.workspace = true
+blade-macros.workspace = true
+blade-util.workspace = true
+bytemuck = "1"
 
 [target.'cfg(target_env = "ohos")'.build-dependencies]
 napi-build-ohos = { version = "1.1" }
+naga.workspace = true
 
 [dev-dependencies]
 backtrace.workspace = true

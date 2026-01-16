@@ -8,8 +8,13 @@ use std::env;
 
 fn main() {
     let target = env::var("CARGO_CFG_TARGET_OS");
+    let target_env = env::var("CARGO_CFG_TARGET_ENV");
     println!("cargo::rustc-check-cfg=cfg(gles)");
 
+    // Check WGSL shaders for platforms using Blade renderer (Vulkan or GLES)
+    // - Linux/FreeBSD (not OHOS) with x11 or wayland features
+    // - macOS with macos-blade feature
+    // - OHOS (uses GLES backend via blade-graphics)
     #[cfg(any(
         all(
             not(any(target_os = "macos", target_os = "windows")),
@@ -18,6 +23,13 @@ fn main() {
         all(target_os = "macos", feature = "macos-blade")
     ))]
     check_wgsl_shaders();
+
+    // For OHOS, also check shaders (GLES backend uses WGSL compiled to GLSL ES via naga)
+    if target_env.as_deref() == Ok("ohos") {
+        println!("cargo:rustc-cfg=gles");
+        // napi_build_ohos::setup();
+        check_wgsl_shaders_for_ohos();
+    }
 
     match target.as_deref() {
         Ok("macos") => {
@@ -28,16 +40,38 @@ fn main() {
             #[cfg(target_os = "windows")]
             windows::build();
         }
-        Ok("ohos") => {
-            // Setup NAPI build for OHOS if napi-build-ohos is available
-            // This is optional and only needed when building as a cdylib
-            #[cfg(all(target_env = "ohos", feature = "napi-ohos"))]
-            {
-                napi_build_ohos::setup();
-            }
-        }
         _ => (),
     };
+}
+
+// Check WGSL shaders at build time for OHOS target
+// This ensures the shaders are valid before runtime
+fn check_wgsl_shaders_for_ohos() {
+    use std::path::PathBuf;
+    use std::process;
+    use std::str::FromStr;
+
+    let shader_source_path = "./src/platform/blade/shaders.wgsl";
+    let shader_path = PathBuf::from_str(shader_source_path).unwrap();
+    println!("cargo:rerun-if-changed={}", &shader_path.display());
+
+    let shader_source = match std::fs::read_to_string(&shader_path) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("cargo::warning=Could not read WGSL shader file for OHOS: {}", e);
+            return;
+        }
+    };
+
+    match naga::front::wgsl::parse_str(&shader_source) {
+        Ok(_) => {
+            // Shader is valid
+        }
+        Err(e) => {
+            println!("cargo::error=WGSL shader compilation failed for OHOS:\n{}", e);
+            process::exit(1);
+        }
+    }
 }
 
 #[cfg(any(

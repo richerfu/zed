@@ -5,6 +5,7 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc};
 use anyhow::Result;
 use futures::channel::oneshot;
 use openharmony_ability::{Event, OpenHarmonyApp};
+use util::ResultExt;
 
 use crate::{
     Action, AnyWindowHandle, App, AppCell, BackgroundExecutor, ClipboardItem, CursorStyle,
@@ -29,7 +30,7 @@ pub(crate) struct OhosPlatform {
     text_system: Arc<dyn PlatformTextSystem>,
     primary_display: Rc<RefCell<Option<OhosDisplay>>>,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
-    gpu_context: BladeContext,
+    gpu_context: Arc<BladeContext>,
 }
 
 // Global storage for the gpui_app weak reference
@@ -66,10 +67,10 @@ impl OhosPlatform {
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
         let text_system = Arc::new(OhosTextSystem::new());
-        
+
         // Initialize GPU context for Blade renderer, same as Linux Wayland
         // Note: ZED_DEVICE_ID environment variable is optional - if not set, device_id defaults to 0
-        let gpu_context = BladeContext::new()
+        let gpu_context = Arc::new(BladeContext::new()
             .map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to create GPU context: {}. \
@@ -77,7 +78,7 @@ impl OhosPlatform {
                     If you need to specify a GPU device, set ZED_DEVICE_ID to a 4-digit hex PCI ID (e.g., '0x1234').",
                     e
                 )
-            })?;
+            })?);
 
         Ok(Self {
             app: Rc::new(RefCell::new(None)),
@@ -112,9 +113,7 @@ impl OhosPlatform {
         }
     }
 
-    fn handle_ohos_event(&self, event: &Event) {
-        hilog_debug!("OhosPlatform: Received event: {:?}", event);
-
+    fn handle_ohos_event(&self, event: &Event, on_finish_launching: Option<Box<dyn FnOnce()>>) {
         // First, process any GPUI tasks queued for the main thread
         // This ensures tasks are processed in the run_loop, integrating GPUI with OpenHarmony's event loop
         self.run_foreground_tasks();
@@ -123,49 +122,33 @@ impl OhosPlatform {
         if let Some(app_weak) = GPUI_APP.with(|cell| cell.borrow().clone()) {
             if let Some(app) = app_weak.upgrade() {
                 app.borrow_mut().update(|app| {
-                    let s = format!("OhosPlatform: Handling event: {:?}", event);
-                    match event {
-                        Event::WindowRedraw { .. } => {
-                            hilog_debug!(
-                                "OhosPlatform: WindowRedraw event - refreshing windows for event-driven render"
-                            );
-                            app.refresh_windows();
-                        }
-                        Event::WindowResize(size) => {
-                            hilog_debug!(
-                                "OhosPlatform: WindowResize event - size: {}x{}",
-                                size.width,
-                                size.height
-                            );
-                            // Window resize is handled by individual windows through their callbacks
-                            // Trigger a refresh to update the window
-                            app.refresh_windows();
-                        }
-                        Event::Input(_input_event) => {
-                            hilog_debug!("OhosPlatform: Input event received");
-                            // Input events are handled by windows through their callbacks
-                            // The callbacks are set up in Window::new
-                            // Input events may also require rendering, so refresh windows
-                            app.refresh_windows();
-                        }
-                        Event::GainedFocus => {
-                            hilog_debug!("OhosPlatform: GainedFocus event");
-                            app.refresh_windows();
-                        }
-                        Event::LostFocus => {
-                            hilog_debug!("OhosPlatform: LostFocus event");
-                            app.refresh_windows();
-                        }
-                        Event::ConfigChanged(..) => {
-                            hilog_debug!("OhosPlatform: ConfigChanged event");
-                            app.refresh_windows();
-                        }
-                        Event::WindowDestroy => {
-                            hilog_debug!("OhosPlatform: WindowDestroy event");
-                        }
-                        _ => {
-                            hilog_debug!("OhosPlatform: Unhandled event: {:?}", event);
-                        }
+                    // Route events to individual windows first
+                    // This allows windows to handle events before app-level processing
+                    // Note: We access windows through the App to call OhosWindow::handle_event
+                    let mut on_finish = on_finish_launching;
+                    for window_handle in app.windows() {
+                        let callback_to_pass = on_finish.take(); // Only pass to first window
+                        window_handle
+                            .update(app, |_root_view, window, _cx| {
+                                // Access platform_window and call handle_event if it's an OhosWindow
+                                // Since we're on OHOS platform, all platform_window instances should be OhosWindow
+                                // We use unsafe downcast because Rust's type system can't verify this
+                                let platform_window = &window.platform_window;
+
+                                // Unsafe: We know it's OhosWindow on OHOS platform, but Rust can't verify this
+                                // This is safe because:
+                                // 1. We're only on OHOS platform when this code runs
+                                // 2. OhosPlatform::open_window only creates OhosWindow instances
+                                unsafe {
+                                    let ohos_window_ptr = platform_window.as_ref()
+                                        as *const dyn PlatformWindow
+                                        as *const OhosWindow;
+                                    // Pass on_finish_launching to handle_event, which will call it after renderer initialization
+                                    // Only the first window will receive the callback
+                                    (*ohos_window_ptr).handle_event(event, callback_to_pass);
+                                }
+                            })
+                            .log_err();
                     }
                 });
             } else {
@@ -197,18 +180,19 @@ impl Platform for OhosPlatform {
         }
 
         let platform = self as *const Self;
-        let mut on_finish = Some(on_finish_launching);
+        let on_finish = Rc::new(RefCell::new(Some(on_finish_launching)));
         if let Some(app) = self.app.borrow().clone() {
-            app.run_loop(move |event: Event| match event {
-                Event::SurfaceCreate { .. } => {
-                    if let Some(callback) = on_finish.take() {
-                        callback();
-                    }
+            let on_finish_clone = on_finish.clone();
+            app.run_loop(move |event: Event| {
+                if let Some(platform_ref) = unsafe { platform.as_ref() } {
+                    // Only take on_finish_launching when we receive SurfaceCreate event
+                    let callback = if matches!(event, Event::SurfaceCreate { .. }) {
+                        on_finish_clone.borrow_mut().take()
+                    } else {
+                        None
+                    };
+                    platform_ref.handle_ohos_event(&event, callback);
                 }
-                _ => unsafe {
-                    let platform: &Self = &*platform;
-                    platform.handle_ohos_event(&event);
-                },
             });
         } else {
             hilog_warn!("OhosPlatform: App not set");
@@ -288,7 +272,7 @@ impl Platform for OhosPlatform {
                 self.app.clone(),
                 handle,
                 options,
-                &self.gpu_context,
+                self.gpu_context.clone(),
             )?))
         } else {
             Err(anyhow::anyhow!("OpenHarmonyApp not set"))
