@@ -14,6 +14,230 @@ use bytemuck::{Pod, Zeroable};
 use media::core_video::CVMetalTextureCache;
 use std::sync::Arc;
 
+// OHOS vertex layouts - used instead of storage buffers because
+// GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS = 0 on OHOS
+#[cfg(target_env = "ohos")]
+mod ohos_vertex_layouts {
+    use super::*;
+
+    /// Create a VertexLayout for Quad struct.
+    /// The layout matches QuadVertexInput in ohos/shaders.wgsl
+    pub fn quad_layout() -> gpu::VertexLayout {
+        gpu::VertexLayout {
+            attributes: vec![
+                // @location(0) order_border_style: vec2<u32> - order + border_style at offset 0
+                ("order_border_style", gpu::VertexAttribute { offset: 0, format: gpu::VertexFormat::U32Vec2 }),
+                // @location(1) bounds_origin: vec2<f32> - bounds.origin at offset 8
+                ("bounds_origin", gpu::VertexAttribute { offset: 8, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(2) bounds_size: vec2<f32> - bounds.size at offset 16
+                ("bounds_size", gpu::VertexAttribute { offset: 16, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(3) content_mask_origin: vec2<f32> - content_mask.bounds.origin at offset 24
+                ("content_mask_origin", gpu::VertexAttribute { offset: 24, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(4) content_mask_size: vec2<f32> - content_mask.bounds.size at offset 32
+                ("content_mask_size", gpu::VertexAttribute { offset: 32, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(5) background_tag_colorspace: vec2<u32> - background.tag + color_space at offset 40
+                ("background_tag_colorspace", gpu::VertexAttribute { offset: 40, format: gpu::VertexFormat::U32Vec2 }),
+                // @location(6) background_solid: vec4<f32> - background.solid (Hsla) at offset 48
+                ("background_solid", gpu::VertexAttribute { offset: 48, format: gpu::VertexFormat::F32Vec4 }),
+                // @location(7) background_angle: f32 - background.gradient_angle_or_pattern_height at offset 64
+                ("background_angle", gpu::VertexAttribute { offset: 64, format: gpu::VertexFormat::F32 }),
+                // @location(8) background_color0: vec4<f32> - background.colors[0].color at offset 68
+                ("background_color0", gpu::VertexAttribute { offset: 68, format: gpu::VertexFormat::F32Vec4 }),
+                // @location(9) background_stop0: f32 - background.colors[0].percentage at offset 84
+                ("background_stop0", gpu::VertexAttribute { offset: 84, format: gpu::VertexFormat::F32 }),
+                // @location(10) background_color1: vec4<f32> - background.colors[1].color at offset 88
+                ("background_color1", gpu::VertexAttribute { offset: 88, format: gpu::VertexFormat::F32Vec4 }),
+                // @location(11) background_stop1: f32 - background.colors[1].percentage at offset 104
+                ("background_stop1", gpu::VertexAttribute { offset: 104, format: gpu::VertexFormat::F32 }),
+                // @location(12) border_color: vec4<f32> - border_color at offset 112
+                ("border_color", gpu::VertexAttribute { offset: 112, format: gpu::VertexFormat::F32Vec4 }),
+                // @location(13) corner_radii: vec4<f32> - corner_radii at offset 128
+                ("corner_radii", gpu::VertexAttribute { offset: 128, format: gpu::VertexFormat::F32Vec4 }),
+                // @location(14) border_widths: vec4<f32> - border_widths at offset 144
+                ("border_widths", gpu::VertexAttribute { offset: 144, format: gpu::VertexFormat::F32Vec4 }),
+            ],
+            stride: std::mem::size_of::<Quad>() as u32, // 160 bytes
+        }
+    }
+
+    /// Create a VertexLayout for Shadow struct.
+    /// Shadow struct layout:
+    /// - order: u32 (offset 0)
+    /// - blur_radius: f32 (offset 4) - ScaledPixels wraps f32
+    /// - bounds: Bounds (offset 8, 16 bytes)
+    /// - corner_radii: Corners (offset 24, 16 bytes)
+    /// - content_mask: ContentMask (offset 40, 16 bytes)
+    /// - color: Hsla (offset 56, 16 bytes)
+    /// Total: 72 bytes
+    pub fn shadow_layout() -> gpu::VertexLayout {
+        gpu::VertexLayout {
+            attributes: vec![
+                // @location(0) order: u32
+                ("order", gpu::VertexAttribute { offset: 0, format: gpu::VertexFormat::U32 }),
+                // @location(1) blur_radius: f32
+                ("blur_radius", gpu::VertexAttribute { offset: 4, format: gpu::VertexFormat::F32 }),
+                // @location(2) bounds_origin: vec2<f32>
+                ("bounds_origin", gpu::VertexAttribute { offset: 8, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(3) bounds_size: vec2<f32>
+                ("bounds_size", gpu::VertexAttribute { offset: 16, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(4) corner_radii: vec4<f32>
+                ("corner_radii", gpu::VertexAttribute { offset: 24, format: gpu::VertexFormat::F32Vec4 }),
+                // @location(5) content_mask_origin: vec2<f32>
+                ("content_mask_origin", gpu::VertexAttribute { offset: 40, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(6) content_mask_size: vec2<f32>
+                ("content_mask_size", gpu::VertexAttribute { offset: 48, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(7) color: vec4<f32>
+                ("color", gpu::VertexAttribute { offset: 56, format: gpu::VertexFormat::F32Vec4 }),
+            ],
+            stride: std::mem::size_of::<Shadow>() as u32,
+        }
+    }
+
+    /// Create a VertexLayout for PathRasterizationVertex struct.
+    pub fn path_rasterization_vertex_layout() -> gpu::VertexLayout {
+        gpu::VertexLayout {
+            attributes: vec![
+                // @location(0) xy_position: vec2<f32>
+                ("xy_position", gpu::VertexAttribute { offset: 0, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(1) st_position: vec2<f32>
+                ("st_position", gpu::VertexAttribute { offset: 8, format: gpu::VertexFormat::F32Vec2 }),
+                // Background starts at offset 16
+                // @location(2) background_tag_colorspace: vec2<u32>
+                ("background_tag_colorspace", gpu::VertexAttribute { offset: 16, format: gpu::VertexFormat::U32Vec2 }),
+                // @location(3) background_solid: vec4<f32> - at offset 24
+                ("background_solid", gpu::VertexAttribute { offset: 24, format: gpu::VertexFormat::F32Vec4 }),
+                // @location(4) background_angle: f32 - at offset 40
+                ("background_angle", gpu::VertexAttribute { offset: 40, format: gpu::VertexFormat::F32 }),
+                // @location(5) background_color0: vec4<f32> - at offset 44
+                ("background_color0", gpu::VertexAttribute { offset: 44, format: gpu::VertexFormat::F32Vec4 }),
+                // @location(6) background_stop0: f32 - at offset 60
+                ("background_stop0", gpu::VertexAttribute { offset: 60, format: gpu::VertexFormat::F32 }),
+                // @location(7) background_color1: vec4<f32> - at offset 64
+                ("background_color1", gpu::VertexAttribute { offset: 64, format: gpu::VertexFormat::F32Vec4 }),
+                // @location(8) background_stop1: f32 - at offset 80
+                ("background_stop1", gpu::VertexAttribute { offset: 80, format: gpu::VertexFormat::F32 }),
+                // Bounds starts after Background (84 + 4 pad = 88)
+                // @location(9) bounds_origin: vec2<f32>
+                ("bounds_origin", gpu::VertexAttribute { offset: 88, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(10) bounds_size: vec2<f32>
+                ("bounds_size", gpu::VertexAttribute { offset: 96, format: gpu::VertexFormat::F32Vec2 }),
+            ],
+            stride: std::mem::size_of::<PathRasterizationVertex>() as u32,
+        }
+    }
+
+    /// Create a VertexLayout for PathSprite struct.
+    pub fn path_sprite_layout() -> gpu::VertexLayout {
+        gpu::VertexLayout {
+            attributes: vec![
+                // @location(0) bounds_origin: vec2<f32>
+                ("bounds_origin", gpu::VertexAttribute { offset: 0, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(1) bounds_size: vec2<f32>
+                ("bounds_size", gpu::VertexAttribute { offset: 8, format: gpu::VertexFormat::F32Vec2 }),
+            ],
+            stride: std::mem::size_of::<PathSprite>() as u32,
+        }
+    }
+
+    /// Create a VertexLayout for Underline struct.
+    pub fn underline_layout() -> gpu::VertexLayout {
+        gpu::VertexLayout {
+            attributes: vec![
+                // @location(0) order: u32
+                ("order", gpu::VertexAttribute { offset: 0, format: gpu::VertexFormat::U32 }),
+                // @location(1) pad: u32
+                ("pad", gpu::VertexAttribute { offset: 4, format: gpu::VertexFormat::U32 }),
+                // @location(2) bounds_origin: vec2<f32>
+                ("bounds_origin", gpu::VertexAttribute { offset: 8, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(3) bounds_size: vec2<f32>
+                ("bounds_size", gpu::VertexAttribute { offset: 16, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(4) content_mask_origin: vec2<f32>
+                ("content_mask_origin", gpu::VertexAttribute { offset: 24, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(5) content_mask_size: vec2<f32>
+                ("content_mask_size", gpu::VertexAttribute { offset: 32, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(6) color: vec4<f32>
+                ("color", gpu::VertexAttribute { offset: 40, format: gpu::VertexFormat::F32Vec4 }),
+                // @location(7) thickness: f32
+                ("thickness", gpu::VertexAttribute { offset: 56, format: gpu::VertexFormat::F32 }),
+                // @location(8) wavy: u32
+                ("wavy", gpu::VertexAttribute { offset: 60, format: gpu::VertexFormat::U32 }),
+            ],
+            stride: std::mem::size_of::<Underline>() as u32,
+        }
+    }
+
+    /// Create a VertexLayout for MonochromeSprite struct.
+    pub fn mono_sprite_layout() -> gpu::VertexLayout {
+        gpu::VertexLayout {
+            attributes: vec![
+                // @location(0) order_pad: vec2<u32> - order + pad
+                ("order_pad", gpu::VertexAttribute { offset: 0, format: gpu::VertexFormat::U32Vec2 }),
+                // @location(1) bounds_origin: vec2<f32>
+                ("bounds_origin", gpu::VertexAttribute { offset: 8, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(2) bounds_size: vec2<f32>
+                ("bounds_size", gpu::VertexAttribute { offset: 16, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(3) content_mask_origin: vec2<f32>
+                ("content_mask_origin", gpu::VertexAttribute { offset: 24, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(4) content_mask_size: vec2<f32>
+                ("content_mask_size", gpu::VertexAttribute { offset: 32, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(5) color: vec4<f32>
+                ("color", gpu::VertexAttribute { offset: 40, format: gpu::VertexFormat::F32Vec4 }),
+                // AtlasTile starts at offset 56
+                // @location(6) tile_texture_id: vec2<u32> - texture_id.index + texture_id.kind
+                ("tile_texture_id", gpu::VertexAttribute { offset: 56, format: gpu::VertexFormat::U32Vec2 }),
+                // @location(7) tile_id_padding: vec2<u32> - tile_id + padding
+                ("tile_id_padding", gpu::VertexAttribute { offset: 64, format: gpu::VertexFormat::U32Vec2 }),
+                // @location(8) tile_bounds_origin: vec2<i32>
+                ("tile_bounds_origin", gpu::VertexAttribute { offset: 72, format: gpu::VertexFormat::I32Vec2 }),
+                // @location(9) tile_bounds_size: vec2<i32>
+                ("tile_bounds_size", gpu::VertexAttribute { offset: 80, format: gpu::VertexFormat::I32Vec2 }),
+                // TransformationMatrix starts at offset 88
+                // @location(10) transform_row0: vec2<f32> - rotation_scale[0]
+                ("transform_row0", gpu::VertexAttribute { offset: 88, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(11) transform_row1: vec2<f32> - rotation_scale[1]
+                ("transform_row1", gpu::VertexAttribute { offset: 96, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(12) transform_translation: vec2<f32>
+                ("transform_translation", gpu::VertexAttribute { offset: 104, format: gpu::VertexFormat::F32Vec2 }),
+            ],
+            stride: std::mem::size_of::<MonochromeSprite>() as u32,
+        }
+    }
+
+    /// Create a VertexLayout for PolychromeSprite struct.
+    pub fn poly_sprite_layout() -> gpu::VertexLayout {
+        gpu::VertexLayout {
+            attributes: vec![
+                // @location(0) order_pad: vec2<u32> - order + pad
+                ("order_pad", gpu::VertexAttribute { offset: 0, format: gpu::VertexFormat::U32Vec2 }),
+                // @location(1) grayscale: u32
+                ("grayscale", gpu::VertexAttribute { offset: 8, format: gpu::VertexFormat::U32 }),
+                // @location(2) opacity: f32
+                ("opacity", gpu::VertexAttribute { offset: 12, format: gpu::VertexFormat::F32 }),
+                // @location(3) bounds_origin: vec2<f32>
+                ("bounds_origin", gpu::VertexAttribute { offset: 16, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(4) bounds_size: vec2<f32>
+                ("bounds_size", gpu::VertexAttribute { offset: 24, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(5) content_mask_origin: vec2<f32>
+                ("content_mask_origin", gpu::VertexAttribute { offset: 32, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(6) content_mask_size: vec2<f32>
+                ("content_mask_size", gpu::VertexAttribute { offset: 40, format: gpu::VertexFormat::F32Vec2 }),
+                // @location(7) corner_radii: vec4<f32>
+                ("corner_radii", gpu::VertexAttribute { offset: 48, format: gpu::VertexFormat::F32Vec4 }),
+                // AtlasTile starts at offset 64
+                // @location(8) tile_texture_id: vec2<u32>
+                ("tile_texture_id", gpu::VertexAttribute { offset: 64, format: gpu::VertexFormat::U32Vec2 }),
+                // @location(9) tile_id_padding: vec2<u32>
+                ("tile_id_padding", gpu::VertexAttribute { offset: 72, format: gpu::VertexFormat::U32Vec2 }),
+                // @location(10) tile_bounds_origin: vec2<i32>
+                ("tile_bounds_origin", gpu::VertexAttribute { offset: 80, format: gpu::VertexFormat::I32Vec2 }),
+                // @location(11) tile_bounds_size: vec2<i32>
+                ("tile_bounds_size", gpu::VertexAttribute { offset: 88, format: gpu::VertexFormat::I32Vec2 }),
+            ],
+            stride: std::mem::size_of::<PolychromeSprite>() as u32,
+        }
+    }
+}
+
 const MAX_FRAME_TIME_MS: u32 = 10000;
 
 #[repr(C)]
@@ -49,24 +273,46 @@ struct SurfaceParams {
     content_mask: PodBounds,
 }
 
+#[cfg(not(target_env = "ohos"))]
 #[derive(blade_macros::ShaderData)]
 struct ShaderQuadsData {
     globals: GlobalParams,
     b_quads: gpu::BufferPiece,
 }
 
+#[cfg(target_env = "ohos")]
+#[derive(blade_macros::ShaderData)]
+struct ShaderQuadsData {
+    globals: GlobalParams,
+}
+
+#[cfg(not(target_env = "ohos"))]
 #[derive(blade_macros::ShaderData)]
 struct ShaderShadowsData {
     globals: GlobalParams,
     b_shadows: gpu::BufferPiece,
 }
 
+#[cfg(target_env = "ohos")]
+#[derive(blade_macros::ShaderData)]
+struct ShaderShadowsData {
+    globals: GlobalParams,
+}
+
+#[cfg(not(target_env = "ohos"))]
 #[derive(blade_macros::ShaderData)]
 struct ShaderPathRasterizationData {
     globals: GlobalParams,
     b_path_vertices: gpu::BufferPiece,
 }
 
+#[cfg(target_env = "ohos")]
+#[derive(blade_macros::ShaderData)]
+struct ShaderPathRasterizationData {
+    globals: GlobalParams,
+}
+
+#[cfg(not(target_env = "ohos"))]
 #[derive(blade_macros::ShaderData)]
 struct ShaderPathsData {
     globals: GlobalParams,
@@ -75,12 +321,28 @@ struct ShaderPathsData {
     b_path_sprites: gpu::BufferPiece,
 }
 
+#[cfg(target_env = "ohos")]
+#[derive(blade_macros::ShaderData)]
+struct ShaderPathsData {
+    globals: GlobalParams,
+    t_sprite: gpu::TextureView,
+    s_sprite: gpu::Sampler,
+}
+
+#[cfg(not(target_env = "ohos"))]
 #[derive(blade_macros::ShaderData)]
 struct ShaderUnderlinesData {
     globals: GlobalParams,
     b_underlines: gpu::BufferPiece,
 }
 
+#[cfg(target_env = "ohos")]
+#[derive(blade_macros::ShaderData)]
+struct ShaderUnderlinesData {
+    globals: GlobalParams,
+}
+
+#[cfg(not(target_env = "ohos"))]
 #[derive(blade_macros::ShaderData)]
 struct ShaderMonoSpritesData {
     globals: GlobalParams,
@@ -91,12 +353,31 @@ struct ShaderMonoSpritesData {
     b_mono_sprites: gpu::BufferPiece,
 }
 
+#[cfg(target_env = "ohos")]
+#[derive(blade_macros::ShaderData)]
+struct ShaderMonoSpritesData {
+    globals: GlobalParams,
+    gamma_ratios: [f32; 4],
+    grayscale_enhanced_contrast: f32,
+    t_sprite: gpu::TextureView,
+    s_sprite: gpu::Sampler,
+}
+
+#[cfg(not(target_env = "ohos"))]
 #[derive(blade_macros::ShaderData)]
 struct ShaderPolySpritesData {
     globals: GlobalParams,
     t_sprite: gpu::TextureView,
     s_sprite: gpu::Sampler,
     b_poly_sprites: gpu::BufferPiece,
+}
+
+#[cfg(target_env = "ohos")]
+#[derive(blade_macros::ShaderData)]
+struct ShaderPolySpritesData {
+    globals: GlobalParams,
+    t_sprite: gpu::TextureView,
+    s_sprite: gpu::Sampler,
 }
 
 #[derive(blade_macros::ShaderData)]
@@ -142,18 +423,43 @@ impl BladePipelines {
             "Initializing Blade pipelines for surface {:?}",
             surface_info
         );
+        #[cfg(target_env = "ohos")]
+        let shader = gpu.create_shader(gpu::ShaderDesc {
+            source: include_str!("../ohos/shaders.wgsl"),
+        });
+        #[cfg(not(target_env = "ohos"))]
         let shader = gpu.create_shader(gpu::ShaderDesc {
             source: include_str!("shaders.wgsl"),
         });
         shader.check_struct_size::<GlobalParams>();
         shader.check_struct_size::<SurfaceParams>();
-        shader.check_struct_size::<Quad>();
-        shader.check_struct_size::<Shadow>();
-        shader.check_struct_size::<PathRasterizationVertex>();
-        shader.check_struct_size::<PathSprite>();
-        shader.check_struct_size::<Underline>();
-        shader.check_struct_size::<MonochromeSprite>();
-        shader.check_struct_size::<PolychromeSprite>();
+        // Skip struct size checks on OHOS since we use different data passing mechanism
+        #[cfg(not(target_env = "ohos"))]
+        {
+            shader.check_struct_size::<Quad>();
+            shader.check_struct_size::<Shadow>();
+            shader.check_struct_size::<PathRasterizationVertex>();
+            shader.check_struct_size::<PathSprite>();
+            shader.check_struct_size::<Underline>();
+            shader.check_struct_size::<MonochromeSprite>();
+            shader.check_struct_size::<PolychromeSprite>();
+        }
+
+        // OHOS vertex layouts - stored here to ensure they live long enough
+        #[cfg(target_env = "ohos")]
+        let quad_layout = ohos_vertex_layouts::quad_layout();
+        #[cfg(target_env = "ohos")]
+        let shadow_layout = ohos_vertex_layouts::shadow_layout();
+        #[cfg(target_env = "ohos")]
+        let path_rasterization_layout = ohos_vertex_layouts::path_rasterization_vertex_layout();
+        #[cfg(target_env = "ohos")]
+        let path_sprite_layout = ohos_vertex_layouts::path_sprite_layout();
+        #[cfg(target_env = "ohos")]
+        let underline_layout = ohos_vertex_layouts::underline_layout();
+        #[cfg(target_env = "ohos")]
+        let mono_sprite_layout = ohos_vertex_layouts::mono_sprite_layout();
+        #[cfg(target_env = "ohos")]
+        let poly_sprite_layout = ohos_vertex_layouts::poly_sprite_layout();
 
         // See https://apoorvaj.io/alpha-compositing-opengl-blending-and-premultiplied-alpha/
         let blend_mode = match surface_info.alpha {
@@ -172,6 +478,9 @@ impl BladePipelines {
                 name: "quads",
                 data_layouts: &[&ShaderQuadsData::layout()],
                 vertex: shader.at("vs_quad"),
+                #[cfg(target_env = "ohos")]
+                vertex_fetches: &[gpu::VertexFetchState { layout: &quad_layout, instanced: true }],
+                #[cfg(not(target_env = "ohos"))]
                 vertex_fetches: &[],
                 primitive: gpu::PrimitiveState {
                     topology: gpu::PrimitiveTopology::TriangleStrip,
@@ -186,6 +495,9 @@ impl BladePipelines {
                 name: "shadows",
                 data_layouts: &[&ShaderShadowsData::layout()],
                 vertex: shader.at("vs_shadow"),
+                #[cfg(target_env = "ohos")]
+                vertex_fetches: &[gpu::VertexFetchState { layout: &shadow_layout, instanced: true }],
+                #[cfg(not(target_env = "ohos"))]
                 vertex_fetches: &[],
                 primitive: gpu::PrimitiveState {
                     topology: gpu::PrimitiveTopology::TriangleStrip,
@@ -200,6 +512,9 @@ impl BladePipelines {
                 name: "path_rasterization",
                 data_layouts: &[&ShaderPathRasterizationData::layout()],
                 vertex: shader.at("vs_path_rasterization"),
+                #[cfg(target_env = "ohos")]
+                vertex_fetches: &[gpu::VertexFetchState { layout: &path_rasterization_layout, instanced: false }],
+                #[cfg(not(target_env = "ohos"))]
                 vertex_fetches: &[],
                 primitive: gpu::PrimitiveState {
                     topology: gpu::PrimitiveTopology::TriangleList,
@@ -228,6 +543,9 @@ impl BladePipelines {
                 name: "paths",
                 data_layouts: &[&ShaderPathsData::layout()],
                 vertex: shader.at("vs_path"),
+                #[cfg(target_env = "ohos")]
+                vertex_fetches: &[gpu::VertexFetchState { layout: &path_sprite_layout, instanced: true }],
+                #[cfg(not(target_env = "ohos"))]
                 vertex_fetches: &[],
                 primitive: gpu::PrimitiveState {
                     topology: gpu::PrimitiveTopology::TriangleStrip,
@@ -249,6 +567,9 @@ impl BladePipelines {
                 name: "underlines",
                 data_layouts: &[&ShaderUnderlinesData::layout()],
                 vertex: shader.at("vs_underline"),
+                #[cfg(target_env = "ohos")]
+                vertex_fetches: &[gpu::VertexFetchState { layout: &underline_layout, instanced: true }],
+                #[cfg(not(target_env = "ohos"))]
                 vertex_fetches: &[],
                 primitive: gpu::PrimitiveState {
                     topology: gpu::PrimitiveTopology::TriangleStrip,
@@ -263,6 +584,9 @@ impl BladePipelines {
                 name: "mono-sprites",
                 data_layouts: &[&ShaderMonoSpritesData::layout()],
                 vertex: shader.at("vs_mono_sprite"),
+                #[cfg(target_env = "ohos")]
+                vertex_fetches: &[gpu::VertexFetchState { layout: &mono_sprite_layout, instanced: true }],
+                #[cfg(not(target_env = "ohos"))]
                 vertex_fetches: &[],
                 primitive: gpu::PrimitiveState {
                     topology: gpu::PrimitiveTopology::TriangleStrip,
@@ -277,6 +601,9 @@ impl BladePipelines {
                 name: "poly-sprites",
                 data_layouts: &[&ShaderPolySpritesData::layout()],
                 vertex: shader.at("vs_poly_sprite"),
+                #[cfg(target_env = "ohos")]
+                vertex_fetches: &[gpu::VertexFetchState { layout: &poly_sprite_layout, instanced: true }],
+                #[cfg(not(target_env = "ohos"))]
                 vertex_fetches: &[],
                 primitive: gpu::PrimitiveState {
                     topology: gpu::PrimitiveTopology::TriangleStrip,
@@ -611,6 +938,12 @@ impl BladeRenderer {
                 }));
             }
             let vertex_buf = unsafe { self.instance_belt.alloc_typed(&vertices, &self.gpu) };
+            #[cfg(target_env = "ohos")]
+            {
+                encoder.bind(0, &ShaderPathRasterizationData { globals });
+                encoder.bind_vertex(0, vertex_buf);
+            }
+            #[cfg(not(target_env = "ohos"))]
             encoder.bind(
                 0,
                 &ShaderPathRasterizationData {
@@ -681,6 +1014,12 @@ impl BladeRenderer {
                 PrimitiveBatch::Quads(quads) => {
                     let instance_buf = unsafe { self.instance_belt.alloc_typed(quads, &self.gpu) };
                     let mut encoder = pass.with(&self.pipelines.quads);
+                    #[cfg(target_env = "ohos")]
+                    {
+                        encoder.bind(0, &ShaderQuadsData { globals });
+                        encoder.bind_vertex(0, instance_buf);
+                    }
+                    #[cfg(not(target_env = "ohos"))]
                     encoder.bind(
                         0,
                         &ShaderQuadsData {
@@ -694,6 +1033,12 @@ impl BladeRenderer {
                     let instance_buf =
                         unsafe { self.instance_belt.alloc_typed(shadows, &self.gpu) };
                     let mut encoder = pass.with(&self.pipelines.shadows);
+                    #[cfg(target_env = "ohos")]
+                    {
+                        encoder.bind(0, &ShaderShadowsData { globals });
+                        encoder.bind_vertex(0, instance_buf);
+                    }
+                    #[cfg(not(target_env = "ohos"))]
                     encoder.bind(
                         0,
                         &ShaderShadowsData {
@@ -748,6 +1093,19 @@ impl BladeRenderer {
                     };
                     let instance_buf =
                         unsafe { self.instance_belt.alloc_typed(&sprites, &self.gpu) };
+                    #[cfg(target_env = "ohos")]
+                    {
+                        encoder.bind(
+                            0,
+                            &ShaderPathsData {
+                                globals,
+                                t_sprite: self.path_intermediate_texture_view,
+                                s_sprite: self.atlas_sampler,
+                            },
+                        );
+                        encoder.bind_vertex(0, instance_buf);
+                    }
+                    #[cfg(not(target_env = "ohos"))]
                     encoder.bind(
                         0,
                         &ShaderPathsData {
@@ -763,6 +1121,12 @@ impl BladeRenderer {
                     let instance_buf =
                         unsafe { self.instance_belt.alloc_typed(underlines, &self.gpu) };
                     let mut encoder = pass.with(&self.pipelines.underlines);
+                    #[cfg(target_env = "ohos")]
+                    {
+                        encoder.bind(0, &ShaderUnderlinesData { globals });
+                        encoder.bind_vertex(0, instance_buf);
+                    }
+                    #[cfg(not(target_env = "ohos"))]
                     encoder.bind(
                         0,
                         &ShaderUnderlinesData {
@@ -780,6 +1144,23 @@ impl BladeRenderer {
                     let instance_buf =
                         unsafe { self.instance_belt.alloc_typed(sprites, &self.gpu) };
                     let mut encoder = pass.with(&self.pipelines.mono_sprites);
+                    #[cfg(target_env = "ohos")]
+                    {
+                        encoder.bind(
+                            0,
+                            &ShaderMonoSpritesData {
+                                globals,
+                                gamma_ratios: self.rendering_parameters.gamma_ratios,
+                                grayscale_enhanced_contrast: self
+                                    .rendering_parameters
+                                    .grayscale_enhanced_contrast,
+                                t_sprite: tex_info.raw_view,
+                                s_sprite: self.atlas_sampler,
+                            },
+                        );
+                        encoder.bind_vertex(0, instance_buf);
+                    }
+                    #[cfg(not(target_env = "ohos"))]
                     encoder.bind(
                         0,
                         &ShaderMonoSpritesData {
@@ -803,6 +1184,19 @@ impl BladeRenderer {
                     let instance_buf =
                         unsafe { self.instance_belt.alloc_typed(sprites, &self.gpu) };
                     let mut encoder = pass.with(&self.pipelines.poly_sprites);
+                    #[cfg(target_env = "ohos")]
+                    {
+                        encoder.bind(
+                            0,
+                            &ShaderPolySpritesData {
+                                globals,
+                                t_sprite: tex_info.raw_view,
+                                s_sprite: self.atlas_sampler,
+                            },
+                        );
+                        encoder.bind_vertex(0, instance_buf);
+                    }
+                    #[cfg(not(target_env = "ohos"))]
                     encoder.bind(
                         0,
                         &ShaderPolySpritesData {

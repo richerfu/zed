@@ -26,8 +26,6 @@ fn main() {
 
     // For OHOS, also check shaders (GLES backend uses WGSL compiled to GLSL ES via naga)
     if target_env.as_deref() == Ok("ohos") {
-        println!("cargo:rustc-cfg=gles");
-        // napi_build_ohos::setup();
         check_wgsl_shaders_for_ohos();
     }
 
@@ -51,7 +49,7 @@ fn check_wgsl_shaders_for_ohos() {
     use std::process;
     use std::str::FromStr;
 
-    let shader_source_path = "./src/platform/blade/shaders.wgsl";
+    let shader_source_path = "./src/platform/ohos/shaders.wgsl";
     let shader_path = PathBuf::from_str(shader_source_path).unwrap();
     println!("cargo:rerun-if-changed={}", &shader_path.display());
 

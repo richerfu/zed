@@ -11310,6 +11310,7 @@ dependencies = [
 [[package]]
 name = "openharmony-ability"
 version = "0.3.0"
+source = "git+https://github.com/harmony-contrib/openharmony-ability.git#6dd10cdf4e6afd4f8fbe4ac4f82dc26a66ab8be2"
 dependencies = [
  "napi-derive-ohos",
  "napi-ohos",
@@ -11322,6 +11323,7 @@ dependencies = [
 [[package]]
 name = "openharmony-ability-derive"
 version = "0.3.0"
+source = "git+https://github.com/harmony-contrib/openharmony-ability.git#6dd10cdf4e6afd4f8fbe4ac4f82dc26a66ab8be2"
 dependencies = [
  "proc-macro2",
  "quote",
