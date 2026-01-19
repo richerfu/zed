@@ -243,8 +243,8 @@ windows-numerics = "0.2"
 windows-registry = "0.5"
 
 [target.'cfg(target_env = "ohos")'.dependencies]
-openharmony-ability = { path = "../../../../ohos-rs/openharmony-activity/crates/ability" }
-openharmony-ability-derive = { path = "../../../../ohos-rs/openharmony-activity/crates/derive"}
+openharmony-ability = { git = "https://github.com/harmony-contrib/openharmony-ability.git" }
+openharmony-ability-derive = { git = "https://github.com/harmony-contrib/openharmony-ability.git" }
 napi-ohos = { version = "1.1" }
 napi-derive-ohos = { version = "1.1" }
 ohos-hilog-binding = "0.1.2"
