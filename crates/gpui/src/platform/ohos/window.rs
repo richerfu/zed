@@ -103,47 +103,89 @@ impl OhosWindow {
             anyhow::anyhow!("OpenHarmonyApp not available when initializing renderer")
         })?;
 
-        let native_window = app_ref.native_window().ok_or_else(|| {
+        // Check that native_window is available - this is required for the renderer to work.
+        // The actual window handle is obtained via HasWindowHandle trait implementation.
+        let _native_window = app_ref.native_window().ok_or_else(|| {
             anyhow::anyhow!(
                 "native_window not available yet - SurfaceCreate event may not have been received"
             )
         })?;
 
-        let bounds = self.bounds.borrow();
+        // Get the actual window size from content_rect.
+        // Using the correct size is important because mismatched sizes between
+        // the surface configuration and the actual native_window can cause
+        // rendering issues (stretched/cropped content, black borders, etc.)
+        // even though create_platform_window_surface itself won't fail.
+        let content_rect = app_ref.content_rect();
+        let width = if content_rect.width > 0 {
+            content_rect.width as u32
+        } else {
+            // Fallback to bounds if content_rect is not available yet
+            self.bounds.borrow().size.width.0 as u32
+        };
+        let height = if content_rect.height > 0 {
+            content_rect.height as u32
+        } else {
+            self.bounds.borrow().size.height.0 as u32
+        };
+
+        hilog_debug!("OhosWindow: Initializing renderer with size {}x{}", width, height);
+
+        // Update window bounds to match actual content_rect
+        if content_rect.width > 0 && content_rect.height > 0 {
+            *self.bounds.borrow_mut() = Bounds::new(
+                point(px(content_rect.left as f32), px(content_rect.top as f32)),
+                size(px(content_rect.width as f32), px(content_rect.height as f32)),
+            );
+        }
+
         let config = BladeSurfaceConfig {
             size: gpu::Extent {
-                width: bounds.size.width.0 as u32,
-                height: bounds.size.height.0 as u32,
+                width,
+                height,
                 depth: 1,
             },
-            transparent: true,
+            transparent: false,
         };
+
+        // Debug: Check window handle before creating renderer
+        match self.window_handle() {
+            Ok(handle) => {
+                hilog_debug!("OhosWindow: Window handle obtained successfully: {:?}", handle.as_raw());
+            }
+            Err(e) => {
+                hilog_warn!("OhosWindow: Failed to get window handle: {:?}", e);
+                return Err(anyhow::anyhow!("Window handle not available: {:?}", e));
+            }
+        }
+
+        hilog_debug!("OhosWindow: Creating BladeRenderer...");
 
         // Create renderer using the window's HasWindowHandle and HasDisplayHandle implementation
         // which will get the raw_window_handle from native_window
         let renderer = BladeRenderer::new(&self.gpu_context, self, config)
-            .map_err(|e| anyhow::anyhow!("Failed to create Blade renderer: {}. Make sure native_window is available from OpenHarmonyApp.", e))?;
+            .map_err(|e| {
+                hilog_warn!("OhosWindow: BladeRenderer::new failed: {}", e);
+                anyhow::anyhow!("Failed to create Blade renderer: {}. Make sure native_window is available from OpenHarmonyApp.", e)
+            })?;
 
         *renderer_guard = Some(renderer);
         hilog_debug!("OhosWindow: Renderer initialized successfully");
         Ok(())
     }
 
-    pub(crate) fn handle_event(&self, event: &Event, on_finish_launching: Option<Box<dyn FnOnce()>>) {
+    pub(crate) fn handle_event(&self, event: &Event) {
         hilog_debug!("OhosWindow: Handling event: {:?}", event);
 
         match event {
             Event::SurfaceCreate { .. } => {
                 hilog_debug!("OhosWindow: SurfaceCreate event received - initializing renderer");
+                // Initialize renderer when SurfaceCreate event is received
+                // Note: on_finish_launching is handled at the platform level (OhosPlatform::handle_ohos_event)
+                // before windows are created.
                 match self.initialize_renderer() {
                     Ok(()) => {
                         hilog_debug!("OhosWindow: Renderer initialized successfully");
-                        // Call on_finish_launching only after renderer has been successfully initialized
-                        // This ensures EGL context is ready before the app continues initialization
-                        if let Some(callback) = on_finish_launching {
-                            hilog_debug!("OhosWindow: Calling on_finish_launching after renderer initialization");
-                            callback();
-                        }
                     }
                     Err(e) => {
                         hilog_warn!("OhosWindow: Failed to initialize renderer: {}. Make sure native_window is available from OpenHarmonyApp.", e);
@@ -234,7 +276,15 @@ impl HasWindowHandle for OhosWindow {
     ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
         if let Some(app) = self.app.borrow().as_ref() {
             if let Some(native_window) = app.native_window() {
-                if let Some(raw_handle) = native_window.raw_window_handle() {
+                // NOTE: We directly construct OhosNdkWindowHandle from native_window.raw()
+                // instead of using native_window.raw_window_handle().
+                // This is because the raw_window_handle() method in ohos-xcomponent-binding
+                // reads from a global static variable (RAW_WINDOW) instead of using self.raw,
+                // which can cause issues if the global variable is not properly synchronized.
+                let raw_ptr = native_window.raw();
+                if let Some(non_null_ptr) = std::ptr::NonNull::new(raw_ptr) {
+                    let ohos_handle = raw_window_handle::OhosNdkWindowHandle::new(non_null_ptr);
+                    let raw_handle = raw_window_handle::RawWindowHandle::OhosNdk(ohos_handle);
                     return Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw_handle) });
                 }
             }

@@ -118,16 +118,24 @@ impl OhosPlatform {
         // This ensures tasks are processed in the run_loop, integrating GPUI with OpenHarmony's event loop
         self.run_foreground_tasks();
 
-        // Access GPUI App instance through global storage
+        // Handle on_finish_launching callback first, before routing to windows.
+        // This is critical because windows are created INSIDE the on_finish_launching callback,
+        // so we cannot depend on windows existing before calling it.
+        // This is similar to how macOS handles did_finish_launching.
+        // Note: The callback is only passed when event is SurfaceCreate (checked in run() method),
+        // so we can safely call it here unconditionally.
+        if let Some(callback) = on_finish_launching {
+            hilog_debug!("OhosPlatform: Calling on_finish_launching on SurfaceCreate");
+            callback();
+        }
+
+        // Access GPUI App instance through global storage to route events to windows
         if let Some(app_weak) = GPUI_APP.with(|cell| cell.borrow().clone()) {
             if let Some(app) = app_weak.upgrade() {
                 app.borrow_mut().update(|app| {
-                    // Route events to individual windows first
-                    // This allows windows to handle events before app-level processing
-                    // Note: We access windows through the App to call OhosWindow::handle_event
-                    let mut on_finish = on_finish_launching;
+                    // Route events to individual windows
+                    // This allows windows to handle events for rendering, input, etc.
                     for window_handle in app.windows() {
-                        let callback_to_pass = on_finish.take(); // Only pass to first window
                         window_handle
                             .update(app, |_root_view, window, _cx| {
                                 // Access platform_window and call handle_event if it's an OhosWindow
@@ -143,9 +151,7 @@ impl OhosPlatform {
                                     let ohos_window_ptr = platform_window.as_ref()
                                         as *const dyn PlatformWindow
                                         as *const OhosWindow;
-                                    // Pass on_finish_launching to handle_event, which will call it after renderer initialization
-                                    // Only the first window will receive the callback
-                                    (*ohos_window_ptr).handle_event(event, callback_to_pass);
+                                    (*ohos_window_ptr).handle_event(event);
                                 }
                             })
                             .log_err();
