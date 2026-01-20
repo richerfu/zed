@@ -533,6 +533,8 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, quad: QuadVertexInput) -> Quad
     content_mask.origin = quad.content_mask_origin;
     content_mask.size = quad.content_mask_size;
     
+
+    
     var background_solid_hsla: Hsla;
     background_solid_hsla.h = quad.background_solid.x;
     background_solid_hsla.s = quad.background_solid.y;

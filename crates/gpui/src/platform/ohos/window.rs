@@ -129,13 +129,20 @@ impl OhosWindow {
             self.bounds.borrow().size.height.0 as u32
         };
 
-        hilog_debug!("OhosWindow: Initializing renderer with size {}x{}", width, height);
+        hilog_debug!(
+            "OhosWindow: Initializing renderer with size {}x{}",
+            width,
+            height
+        );
 
         // Update window bounds to match actual content_rect
         if content_rect.width > 0 && content_rect.height > 0 {
             *self.bounds.borrow_mut() = Bounds::new(
                 point(px(content_rect.left as f32), px(content_rect.top as f32)),
-                size(px(content_rect.width as f32), px(content_rect.height as f32)),
+                size(
+                    px(content_rect.width as f32),
+                    px(content_rect.height as f32),
+                ),
             );
         }
 
@@ -145,13 +152,22 @@ impl OhosWindow {
                 height,
                 depth: 1,
             },
-            transparent: false,
+            transparent: true,
         };
+
+        hilog_debug!(
+            "OhosWindow: Surface config - width: {}, height: {}, transparent: false",
+            width,
+            height
+        );
 
         // Debug: Check window handle before creating renderer
         match self.window_handle() {
             Ok(handle) => {
-                hilog_debug!("OhosWindow: Window handle obtained successfully: {:?}", handle.as_raw());
+                hilog_debug!(
+                    "OhosWindow: Window handle obtained successfully: {:?}",
+                    handle.as_raw()
+                );
             }
             Err(e) => {
                 hilog_warn!("OhosWindow: Failed to get window handle: {:?}", e);
@@ -175,8 +191,6 @@ impl OhosWindow {
     }
 
     pub(crate) fn handle_event(&self, event: &Event) {
-        hilog_debug!("OhosWindow: Handling event: {:?}", event);
-
         match event {
             Event::SurfaceCreate { .. } => {
                 hilog_debug!("OhosWindow: SurfaceCreate event received - initializing renderer");
@@ -188,7 +202,10 @@ impl OhosWindow {
                         hilog_debug!("OhosWindow: Renderer initialized successfully");
                     }
                     Err(e) => {
-                        hilog_warn!("OhosWindow: Failed to initialize renderer: {}. Make sure native_window is available from OpenHarmonyApp.", e);
+                        hilog_warn!(
+                            "OhosWindow: Failed to initialize renderer: {}. Make sure native_window is available from OpenHarmonyApp.",
+                            e
+                        );
                     }
                 }
             }
@@ -196,7 +213,8 @@ impl OhosWindow {
                 let width = ohos_size.width as f32;
                 let height = ohos_size.height as f32;
                 let new_size = size(px(width), px(height));
-                *self.bounds.borrow_mut() = Bounds::new(self.bounds.borrow().origin, new_size);
+                let origin = self.bounds.borrow().origin;
+                *self.bounds.borrow_mut() = Bounds::new(origin, new_size);
 
                 // Update renderer's drawable size
                 if let Some(ref mut renderer) = *self.renderer.borrow_mut() {
@@ -208,32 +226,47 @@ impl OhosWindow {
                     renderer.update_drawable_size(device_size);
                 }
 
-                if let Some(ref mut callback) = self.callbacks.borrow_mut().resize {
-                    callback(new_size, *self.scale.borrow());
+                // Take the callback out to avoid holding borrow during execution
+                let scale = *self.scale.borrow();
+                let mut callback = self.callbacks.borrow_mut().resize.take();
+                if let Some(ref mut cb) = callback {
+                    cb(new_size, scale);
                 }
+                // Put it back
+                self.callbacks.borrow_mut().resize = callback;
             }
             Event::WindowRedraw { .. } => {
-                if let Some(ref mut callback) = self.callbacks.borrow_mut().request_frame {
-                    callback(RequestFrameOptions {
+                // Take the callback out to avoid holding borrow during execution
+                // This is critical because the callback will eventually call window.draw()
+                // which may access other parts of OhosWindow
+                let mut callback = self.callbacks.borrow_mut().request_frame.take();
+                if let Some(ref mut cb) = callback {
+                    cb(RequestFrameOptions {
                         require_presentation: true,
                         force_render: false,
                     });
                 } else {
                     hilog_warn!("OhosWindow: WindowRedraw event but no request_frame callback set");
                 }
+                // Put it back for next frame
+                self.callbacks.borrow_mut().request_frame = callback;
             }
             Event::Input(input_event) => {
                 self.handle_input_event(input_event);
             }
             Event::GainedFocus => {
-                if let Some(ref mut callback) = self.callbacks.borrow_mut().active_status_change {
-                    callback(true);
+                let mut callback = self.callbacks.borrow_mut().active_status_change.take();
+                if let Some(ref mut cb) = callback {
+                    cb(true);
                 }
+                self.callbacks.borrow_mut().active_status_change = callback;
             }
             Event::LostFocus => {
-                if let Some(ref mut callback) = self.callbacks.borrow_mut().active_status_change {
-                    callback(false);
+                let mut callback = self.callbacks.borrow_mut().active_status_change.take();
+                if let Some(ref mut cb) = callback {
+                    cb(false);
                 }
+                self.callbacks.borrow_mut().active_status_change = callback;
             }
             Event::ConfigChanged(..) => {
                 let new_scale = self
@@ -243,16 +276,27 @@ impl OhosWindow {
                     .map(|a| a.scale() as f32)
                     .unwrap_or(1.0);
                 *self.scale.borrow_mut() = new_scale;
-                if let Some(ref mut callback) = self.callbacks.borrow_mut().resize {
-                    callback(self.bounds.borrow().size, new_scale);
+                let bounds_size = self.bounds.borrow().size;
+                let mut callback = self.callbacks.borrow_mut().resize.take();
+                if let Some(ref mut cb) = callback {
+                    cb(bounds_size, new_scale);
                 }
+                self.callbacks.borrow_mut().resize = callback;
             }
             Event::WindowDestroy => {
-                if let Some(ref mut callback) = self.callbacks.borrow_mut().should_close {
-                    if callback() {
-                        if let Some(callback) = self.callbacks.borrow_mut().close.take() {
-                            callback();
-                        }
+                // For should_close, we need to call it and check return value
+                let mut should_close_callback = self.callbacks.borrow_mut().should_close.take();
+                let should_close = if let Some(ref mut cb) = should_close_callback {
+                    cb()
+                } else {
+                    true // Default to allowing close if no callback
+                };
+                self.callbacks.borrow_mut().should_close = should_close_callback;
+
+                if should_close {
+                    // close is FnOnce, so we just take and call it
+                    if let Some(callback) = self.callbacks.borrow_mut().close.take() {
+                        callback();
                     }
                 }
             }
@@ -323,7 +367,8 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
-        *self.bounds.borrow_mut() = Bounds::new(self.bounds.borrow().origin, size);
+        let origin = self.bounds.borrow().origin;
+        *self.bounds.borrow_mut() = Bounds::new(origin, size);
     }
 
     fn scale_factor(&self) -> f32 {
@@ -409,19 +454,7 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
-        hilog_debug!("OhosWindow: on_request_frame callback set");
-        let mut callbacks = self.callbacks.borrow_mut();
-        callbacks.request_frame = Some(callback);
-
-        // Request an initial frame to ensure the window renders immediately
-        // This is important because on OHOS, we might not receive a WindowRedraw event immediately
-        if let Some(ref mut cb) = callbacks.request_frame {
-            hilog_debug!("OhosWindow: Requesting initial frame");
-            cb(RequestFrameOptions {
-                require_presentation: true,
-                force_render: true,
-            });
-        }
+        self.callbacks.borrow_mut().request_frame = Some(callback);
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> crate::DispatchEventResult>) {
@@ -473,7 +506,15 @@ impl PlatformWindow for OhosWindow {
         // Use Blade renderer to render the scene (same as Linux/Wayland)
         if let Some(ref mut renderer) = *self.renderer.borrow_mut() {
             let batch_count = scene.batches().count();
-            hilog_debug!("OhosWindow: draw called with {} batches", batch_count);
+            let bounds = *self.bounds.borrow();
+            let scale = *self.scale.borrow();
+            hilog_debug!(
+                "OhosWindow: draw called with {} batches, bounds: {:?}, scale: {}",
+                batch_count,
+                bounds,
+                scale
+            );
+
             renderer.draw(scene);
         } else {
             hilog_warn!("OhosWindow: draw called but renderer is not available");

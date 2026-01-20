@@ -132,31 +132,37 @@ impl OhosPlatform {
         // Access GPUI App instance through global storage to route events to windows
         if let Some(app_weak) = GPUI_APP.with(|cell| cell.borrow().clone()) {
             if let Some(app) = app_weak.upgrade() {
-                app.borrow_mut().update(|app| {
-                    // Route events to individual windows
-                    // This allows windows to handle events for rendering, input, etc.
-                    for window_handle in app.windows() {
-                        window_handle
-                            .update(app, |_root_view, window, _cx| {
-                                // Access platform_window and call handle_event if it's an OhosWindow
-                                // Since we're on OHOS platform, all platform_window instances should be OhosWindow
-                                // We use unsafe downcast because Rust's type system can't verify this
-                                let platform_window = &window.platform_window;
+                // First, collect the OhosWindow pointers OUTSIDE of the borrow_mut scope
+                // This is critical to avoid RefCell already borrowed panic.
+                // The issue is that handle_event -> request_frame callback -> handle.update()
+                // will try to access App again, causing a conflict if we're still in borrow_mut.
+                let ohos_windows: Vec<*const OhosWindow> = {
+                    let mut windows = Vec::new();
+                    app.borrow_mut().update(|app| {
+                        for window_handle in app.windows() {
+                            window_handle
+                                .update(app, |_root_view, window, _cx| {
+                                    let platform_window = &window.platform_window;
+                                    unsafe {
+                                        let ohos_window_ptr = platform_window.as_ref()
+                                            as *const dyn PlatformWindow
+                                            as *const OhosWindow;
+                                        windows.push(ohos_window_ptr);
+                                    }
+                                })
+                                .log_err();
+                        }
+                    });
+                    windows
+                };
 
-                                // Unsafe: We know it's OhosWindow on OHOS platform, but Rust can't verify this
-                                // This is safe because:
-                                // 1. We're only on OHOS platform when this code runs
-                                // 2. OhosPlatform::open_window only creates OhosWindow instances
-                                unsafe {
-                                    let ohos_window_ptr = platform_window.as_ref()
-                                        as *const dyn PlatformWindow
-                                        as *const OhosWindow;
-                                    (*ohos_window_ptr).handle_event(event);
-                                }
-                            })
-                            .log_err();
+                // Now call handle_event OUTSIDE of the app.borrow_mut() scope
+                // This allows the callback to safely call handle.update() without RefCell conflict
+                for ohos_window_ptr in ohos_windows {
+                    unsafe {
+                        (*ohos_window_ptr).handle_event(event);
                     }
-                });
+                }
             } else {
                 hilog_warn!("OhosPlatform: App weak reference could not be upgraded");
             }
