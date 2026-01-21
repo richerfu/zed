@@ -3,7 +3,7 @@ use ohos_hilog_binding::{hilog_debug, hilog_info, hilog_warn};
 
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use futures::channel::oneshot;
 use openharmony_ability::{Event, InputEvent, OpenHarmonyApp, Size as OhosSize};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -117,13 +117,14 @@ impl OhosWindow {
         // rendering issues (stretched/cropped content, black borders, etc.)
         // even though create_platform_window_surface itself won't fail.
         let content_rect = app_ref.content_rect();
-        let width = if content_rect.width > 0 {
+        let scale = app_ref.scale() as f32;
+        let device_width = if content_rect.width > 0 {
             content_rect.width as u32
         } else {
             // Fallback to bounds if content_rect is not available yet
             self.bounds.borrow().size.width.0 as u32
         };
-        let height = if content_rect.height > 0 {
+        let device_height = if content_rect.height > 0 {
             content_rect.height as u32
         } else {
             self.bounds.borrow().size.height.0 as u32
@@ -131,25 +132,27 @@ impl OhosWindow {
 
         hilog_debug!(
             "OhosWindow: Initializing renderer with size {}x{}",
-            width,
-            height
+            device_width,
+            device_height
         );
 
-        // Update window bounds to match actual content_rect
+        // Update window bounds to match actual content_rect (convert device px -> logical px)
         if content_rect.width > 0 && content_rect.height > 0 {
-            *self.bounds.borrow_mut() = Bounds::new(
-                point(px(content_rect.left as f32), px(content_rect.top as f32)),
-                size(
-                    px(content_rect.width as f32),
-                    px(content_rect.height as f32),
-                ),
+            let logical_size = size(
+                px(device_width as f32 / scale),
+                px(device_height as f32 / scale),
             );
+            let logical_origin = point(
+                px(content_rect.left as f32 / scale),
+                px(content_rect.top as f32 / scale),
+            );
+            *self.bounds.borrow_mut() = Bounds::new(logical_origin, logical_size);
         }
 
         let config = BladeSurfaceConfig {
             size: gpu::Extent {
-                width,
-                height,
+                width: device_width,
+                height: device_height,
                 depth: 1,
             },
             transparent: true,
@@ -157,8 +160,8 @@ impl OhosWindow {
 
         hilog_debug!(
             "OhosWindow: Surface config - width: {}, height: {}, transparent: false",
-            width,
-            height
+            device_width,
+            device_height
         );
 
         // Debug: Check window handle before creating renderer
@@ -210,24 +213,23 @@ impl OhosWindow {
                 }
             }
             Event::WindowResize(ohos_size) => {
+                let scale = *self.scale.borrow();
                 let width = ohos_size.width as f32;
                 let height = ohos_size.height as f32;
-                let new_size = size(px(width), px(height));
+                let new_size = size(px(width / scale), px(height / scale));
                 let origin = self.bounds.borrow().origin;
                 *self.bounds.borrow_mut() = Bounds::new(origin, new_size);
 
                 // Update renderer's drawable size
                 if let Some(ref mut renderer) = *self.renderer.borrow_mut() {
-                    let scale = *self.scale.borrow();
                     let device_size = Size {
-                        width: DevicePixels((width * scale) as i32),
-                        height: DevicePixels((height * scale) as i32),
+                        width: DevicePixels(width as i32),
+                        height: DevicePixels(height as i32),
                     };
                     renderer.update_drawable_size(device_size);
                 }
 
                 // Take the callback out to avoid holding borrow during execution
-                let scale = *self.scale.borrow();
                 let mut callback = self.callbacks.borrow_mut().resize.take();
                 if let Some(ref mut cb) = callback {
                     cb(new_size, scale);
@@ -526,6 +528,19 @@ impl PlatformWindow for OhosWindow {
         if let Some(ref renderer) = *self.renderer.borrow() {
             renderer.sprite_atlas().clone()
         } else {
+            // Try to initialize renderer lazily; if it still fails, return dummy atlas with error.
+            if self.renderer.borrow().is_none() {
+                if let Err(err) = self.initialize_renderer() {
+                    hilog_warn!(
+                        "OhosWindow: Failed to initialize renderer when fetching atlas: {}",
+                        err
+                    );
+                }
+            }
+            if let Some(ref renderer) = *self.renderer.borrow() {
+                return renderer.sprite_atlas().clone();
+            }
+
             // Fallback to dummy atlas if renderer is not available
             struct DummyAtlas;
             impl PlatformAtlas for DummyAtlas {
@@ -534,7 +549,9 @@ impl PlatformWindow for OhosWindow {
                     _key: &crate::AtlasKey,
                     _build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
                 ) -> Result<Option<crate::AtlasTile>> {
-                    Ok(None)
+                    Err(anyhow!(
+                        "renderer not initialized; sprite atlas unavailable"
+                    ))
                 }
                 fn remove(&self, _key: &crate::AtlasKey) {}
             }
