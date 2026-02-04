@@ -1,9 +1,6 @@
 use collections::HashMap;
 
-use crate::{
-    KeybindingKeystroke, Keystroke, PlatformKeyboardLayout,
-    PlatformKeyboardMapper,
-};
+use crate::{KeybindingKeystroke, Keystroke, PlatformKeyboardLayout, PlatformKeyboardMapper};
 
 pub(crate) struct OhosKeyboardLayout;
 
@@ -32,4 +29,3 @@ impl PlatformKeyboardMapper for OhosKeyboardMapper {
         None
     }
 }
-

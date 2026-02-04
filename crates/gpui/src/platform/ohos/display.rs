@@ -22,9 +22,7 @@ impl OhosDisplay {
 
 impl Debug for OhosDisplay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OhosDisplay")
-            .field("id", &self.id)
-            .finish()
+        f.debug_struct("OhosDisplay").field("id", &self.id).finish()
     }
 }
 
@@ -67,4 +65,3 @@ impl PlatformDisplay for OhosDisplay {
         self.bounds()
     }
 }
-

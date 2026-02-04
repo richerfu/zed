@@ -1,11 +1,17 @@
 #[cfg(target_env = "ohos")]
-use ohos_hilog_binding::{hilog_debug, hilog_info, hilog_warn};
+use log::{debug, warn};
 
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::Arc,
+};
 
 use anyhow::{Result, anyhow};
 use futures::channel::oneshot;
-use openharmony_ability::{Event, InputEvent, OpenHarmonyApp, Size as OhosSize};
+use openharmony_ability::{
+    Event, ImeEvent, InputEvent, OpenHarmonyApp, Size as OhosSize, xcomponent::TouchEvent,
+};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use util::ResultExt;
 
@@ -13,7 +19,8 @@ use std::borrow::Cow;
 
 use crate::platform::blade::{BladeContext, BladeRenderer, BladeSurfaceConfig};
 use crate::{
-    AnyWindowHandle, Bounds, Capslock, DevicePixels, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
+    AnyWindowHandle, Bounds, Capslock, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
     PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
@@ -28,10 +35,39 @@ pub(crate) struct OhosWindow {
     handle: AnyWindowHandle,
     bounds: RefCell<Bounds<Pixels>>,
     scale: RefCell<f32>,
-    input_handler: RefCell<Option<PlatformInputHandler>>,
+    input_handler: Rc<RefCell<Option<PlatformInputHandler>>>,
     callbacks: RefCell<WindowCallbacks>,
     renderer: RefCell<Option<BladeRenderer>>,
     gpu_context: Arc<BladeContext>,
+    foreground_executor: ForegroundExecutor,
+    keyboard_visible: Rc<Cell<bool>>,
+    keyboard_suppressed: Rc<Cell<bool>>,
+    pending_reopen_position: Rc<RefCell<Option<Point<Pixels>>>>,
+}
+
+pub(crate) struct OhosWindowHandle {
+    inner: Rc<RefCell<OhosWindow>>,
+    input_handler: Rc<RefCell<Option<PlatformInputHandler>>>,
+}
+
+impl OhosWindowHandle {
+    pub(crate) fn new(inner: Rc<RefCell<OhosWindow>>) -> Self {
+        let input_handler = inner.borrow().input_handler.clone();
+        Self {
+            inner,
+            input_handler,
+        }
+    }
+
+    fn with_window<R>(&self, f: impl FnOnce(&OhosWindow) -> R) -> R {
+        let window = self.inner.borrow();
+        f(&window)
+    }
+
+    fn with_window_mut<R>(&self, f: impl FnOnce(&mut OhosWindow) -> R) -> R {
+        let mut window = self.inner.borrow_mut();
+        f(&mut window)
+    }
 }
 
 struct WindowCallbacks {
@@ -53,6 +89,7 @@ impl OhosWindow {
         handle: AnyWindowHandle,
         params: WindowParams,
         gpu_context: Arc<BladeContext>,
+        foreground_executor: ForegroundExecutor,
     ) -> Result<Self> {
         let scale = app
             .borrow()
@@ -70,7 +107,7 @@ impl OhosWindow {
             handle,
             bounds: RefCell::new(bounds),
             scale: RefCell::new(scale),
-            input_handler: RefCell::new(None),
+            input_handler: Rc::new(RefCell::new(None)),
             callbacks: RefCell::new(WindowCallbacks {
                 request_frame: None,
                 input: None,
@@ -85,7 +122,28 @@ impl OhosWindow {
             }),
             renderer: RefCell::new(None),
             gpu_context,
+            foreground_executor,
+            keyboard_visible: Rc::new(Cell::new(false)),
+            keyboard_suppressed: Rc::new(Cell::new(false)),
+            pending_reopen_position: Rc::new(RefCell::new(None)),
         })
+    }
+
+    fn show_keyboard_if_needed(&self) {
+        if !self.keyboard_visible.get() && !self.keyboard_suppressed.get() {
+            if let Some(app) = self.app.borrow().as_ref() {
+                app.show_keyboard();
+                self.keyboard_visible.set(true);
+            }
+        }
+    }
+
+    fn hide_keyboard_if_needed(&self) {
+        if self.keyboard_visible.replace(false) {
+            if let Some(app) = self.app.borrow().as_ref() {
+                app.hide_keyboard();
+            }
+        }
     }
 
     /// Initialize the renderer when native_window becomes available (after SurfaceCreate event).
@@ -130,10 +188,9 @@ impl OhosWindow {
             self.bounds.borrow().size.height.0 as u32
         };
 
-        hilog_debug!(
+        debug!(
             "OhosWindow: Initializing renderer with size {}x{}",
-            device_width,
-            device_height
+            device_width, device_height
         );
 
         // Update window bounds to match actual content_rect (convert device px -> logical px)
@@ -158,54 +215,53 @@ impl OhosWindow {
             transparent: true,
         };
 
-        hilog_debug!(
+        debug!(
             "OhosWindow: Surface config - width: {}, height: {}, transparent: false",
-            device_width,
-            device_height
+            device_width, device_height
         );
 
         // Debug: Check window handle before creating renderer
         match self.window_handle() {
             Ok(handle) => {
-                hilog_debug!(
+                debug!(
                     "OhosWindow: Window handle obtained successfully: {:?}",
                     handle.as_raw()
                 );
             }
             Err(e) => {
-                hilog_warn!("OhosWindow: Failed to get window handle: {:?}", e);
+                warn!("OhosWindow: Failed to get window handle: {:?}", e);
                 return Err(anyhow::anyhow!("Window handle not available: {:?}", e));
             }
         }
 
-        hilog_debug!("OhosWindow: Creating BladeRenderer...");
+        debug!("OhosWindow: Creating BladeRenderer...");
 
         // Create renderer using the window's HasWindowHandle and HasDisplayHandle implementation
         // which will get the raw_window_handle from native_window
         let renderer = BladeRenderer::new(&self.gpu_context, self, config)
             .map_err(|e| {
-                hilog_warn!("OhosWindow: BladeRenderer::new failed: {}", e);
+                warn!("OhosWindow: BladeRenderer::new failed: {}", e);
                 anyhow::anyhow!("Failed to create Blade renderer: {}. Make sure native_window is available from OpenHarmonyApp.", e)
             })?;
 
         *renderer_guard = Some(renderer);
-        hilog_debug!("OhosWindow: Renderer initialized successfully");
+        debug!("OhosWindow: Renderer initialized successfully");
         Ok(())
     }
 
     pub(crate) fn handle_event(&self, event: &Event) {
         match event {
             Event::SurfaceCreate { .. } => {
-                hilog_debug!("OhosWindow: SurfaceCreate event received - initializing renderer");
+                debug!("OhosWindow: SurfaceCreate event received - initializing renderer");
                 // Initialize renderer when SurfaceCreate event is received
                 // Note: on_finish_launching is handled at the platform level (OhosPlatform::handle_ohos_event)
                 // before windows are created.
                 match self.initialize_renderer() {
                     Ok(()) => {
-                        hilog_debug!("OhosWindow: Renderer initialized successfully");
+                        debug!("OhosWindow: Renderer initialized successfully");
                     }
                     Err(e) => {
-                        hilog_warn!(
+                        warn!(
                             "OhosWindow: Failed to initialize renderer: {}. Make sure native_window is available from OpenHarmonyApp.",
                             e
                         );
@@ -248,7 +304,7 @@ impl OhosWindow {
                         force_render: false,
                     });
                 } else {
-                    hilog_warn!("OhosWindow: WindowRedraw event but no request_frame callback set");
+                    warn!("OhosWindow: WindowRedraw event but no request_frame callback set");
                 }
                 // Put it back for next frame
                 self.callbacks.borrow_mut().request_frame = callback;
@@ -269,6 +325,9 @@ impl OhosWindow {
                     cb(false);
                 }
                 self.callbacks.borrow_mut().active_status_change = callback;
+                self.keyboard_suppressed.set(false);
+                self.pending_reopen_position.borrow_mut().take();
+                self.hide_keyboard_if_needed();
             }
             Event::ConfigChanged(..) => {
                 let new_scale = self
@@ -302,17 +361,173 @@ impl OhosWindow {
                     }
                 }
             }
+            Event::KeyboardEvent(height) => {
+                if *height <= 0 {
+                    self.keyboard_visible.set(false);
+                    self.keyboard_suppressed.set(true);
+                } else {
+                    self.keyboard_visible.set(true);
+                    self.keyboard_suppressed.set(false);
+                    self.pending_reopen_position.borrow_mut().take();
+                }
+            }
             _ => {}
         }
     }
 
     fn handle_input_event(&self, event: &InputEvent) {
-        // TODO: Convert InputEvent to PlatformInput
-        // This is a placeholder implementation
-        if let Some(ref mut callback) = self.callbacks.borrow_mut().input {
-            // For now, we'll skip input handling as it requires detailed conversion
-            // from openharmony_ability::InputEvent to gpui::PlatformInput
+        match event {
+            InputEvent::ImeEvent(ime_event) => {
+                let handler_ref = self.input_handler.clone();
+                let ime_event = ime_event.clone();
+                let executor = self.foreground_executor.clone();
+                let keyboard_visible = self.keyboard_visible.clone();
+                let keyboard_suppressed = self.keyboard_suppressed.clone();
+
+                executor
+                    .spawn(async move {
+                        let mut handler_guard = handler_ref.borrow_mut();
+                        let Some(handler) = handler_guard.as_mut() else {
+                            return;
+                        };
+
+                        match ime_event {
+                            ImeEvent::TextInputEvent(data) => {
+                                handler.replace_text_in_range(None, &data.text);
+                                handler.unmark_text();
+                            }
+                            ImeEvent::BackspaceEvent(len) => {
+                                let len = (len).max(0) as usize;
+                                if len == 0 {
+                                    return;
+                                }
+
+                                if let Some(selection) = handler.selected_text_range(true) {
+                                    let range = if selection.range.start != selection.range.end {
+                                        selection.range
+                                    } else {
+                                        let caret = if selection.reversed {
+                                            selection.range.start
+                                        } else {
+                                            selection.range.end
+                                        };
+                                        let start = caret.saturating_sub(len);
+                                        start..caret
+                                    };
+                                    handler.replace_text_in_range(Some(range), "");
+                                } else {
+                                    handler.replace_text_in_range(None, "");
+                                }
+                            }
+                            ImeEvent::ImeStatusEvent(status) => {
+                                if matches!(status, openharmony_ability::ime::KeyboardStatus::Hide)
+                                {
+                                    handler.unmark_text();
+                                    keyboard_visible.set(false);
+                                    keyboard_suppressed.set(true);
+                                }
+                            }
+                        }
+                    })
+                    .detach();
+            }
+            InputEvent::TouchEvent(touch_event) => {
+                let scale = *self.scale.borrow();
+                let position = point(px(touch_event.x / scale), px(touch_event.y / scale));
+                let modifiers = Modifiers::default();
+                let input = match touch_event.event_type {
+                    TouchEvent::Down => {
+                        self.handle_touch_focus(position);
+                        self.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
+                            position,
+                            pressed_button: None,
+                            modifiers,
+                        }));
+                        PlatformInput::MouseDown(MouseDownEvent {
+                            button: MouseButton::Left,
+                            position,
+                            modifiers,
+                            click_count: 1,
+                            first_mouse: false,
+                        })
+                    }
+                    TouchEvent::Up => PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers,
+                        click_count: 1,
+                    }),
+                    TouchEvent::Move => {
+                        let pressed = touch_event
+                            .touch_points
+                            .iter()
+                            .any(|point| point.is_pressed);
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position,
+                            pressed_button: pressed.then_some(MouseButton::Left),
+                            modifiers,
+                        })
+                    }
+                    TouchEvent::Cancel | TouchEvent::Unknown => {
+                        return;
+                    }
+                };
+
+                self.dispatch_input(input);
+            }
+            _ => {}
         }
+    }
+
+    fn handle_touch_focus(&self, position: Point<Pixels>) {
+        if !self.keyboard_suppressed.get() || self.keyboard_visible.get() {
+            return;
+        }
+
+        let mut handler_guard = self.input_handler.borrow_mut();
+        let Some(handler) = handler_guard.as_mut() else {
+            return;
+        };
+
+        if handler.character_index_for_point(position).is_some() {
+            // User tapped inside the currently focused input: allow keyboard to re-open.
+            self.keyboard_suppressed.set(false);
+            self.pending_reopen_position.borrow_mut().take();
+            self.show_keyboard_if_needed();
+        } else {
+            // Tap outside current input while keyboard is hidden; defer decision until
+            // after focus updates, in case another input becomes focused.
+            *self.pending_reopen_position.borrow_mut() = Some(position);
+        }
+    }
+
+    fn try_reopen_keyboard_from_pending(&self) {
+        let position = self.pending_reopen_position.borrow_mut().take();
+        let Some(position) = position else {
+            return;
+        };
+
+        if !self.keyboard_suppressed.get() || self.keyboard_visible.get() {
+            return;
+        }
+
+        let mut handler_guard = self.input_handler.borrow_mut();
+        let Some(handler) = handler_guard.as_mut() else {
+            return;
+        };
+
+        if handler.character_index_for_point(position).is_some() {
+            self.keyboard_suppressed.set(false);
+            self.show_keyboard_if_needed();
+        }
+    }
+
+    fn dispatch_input(&self, input: PlatformInput) {
+        let mut callback = self.callbacks.borrow_mut().input.take();
+        if let Some(ref mut cb) = callback {
+            cb(input);
+        }
+        self.callbacks.borrow_mut().input = callback;
     }
 }
 
@@ -320,22 +535,29 @@ impl HasWindowHandle for OhosWindow {
     fn window_handle(
         &self,
     ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-        if let Some(app) = self.app.borrow().as_ref() {
-            if let Some(native_window) = app.native_window() {
-                // NOTE: We directly construct OhosNdkWindowHandle from native_window.raw()
-                // instead of using native_window.raw_window_handle().
-                // This is because the raw_window_handle() method in ohos-xcomponent-binding
-                // reads from a global static variable (RAW_WINDOW) instead of using self.raw,
-                // which can cause issues if the global variable is not properly synchronized.
-                let raw_ptr = native_window.raw();
-                if let Some(non_null_ptr) = std::ptr::NonNull::new(raw_ptr) {
-                    let ohos_handle = raw_window_handle::OhosNdkWindowHandle::new(non_null_ptr);
-                    let raw_handle = raw_window_handle::RawWindowHandle::OhosNdk(ohos_handle);
-                    return Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw_handle) });
-                }
-            }
-        }
-        Err(raw_window_handle::HandleError::Unavailable)
+        self.app
+            .borrow()
+            .as_ref()
+            .and_then(|app| app.native_window())
+            .and_then(|native_window| native_window.raw_window_handle())
+            .map(|raw_handle| unsafe { raw_window_handle::WindowHandle::borrow_raw(raw_handle) })
+            .ok_or(raw_window_handle::HandleError::Unavailable)
+    }
+}
+
+impl HasWindowHandle for OhosWindowHandle {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        self.inner
+            .borrow()
+            .app
+            .borrow()
+            .as_ref()
+            .and_then(|app| app.native_window())
+            .and_then(|native_window| native_window.raw_window_handle())
+            .map(|raw_handle| unsafe { raw_window_handle::WindowHandle::borrow_raw(raw_handle) })
+            .ok_or(raw_window_handle::HandleError::Unavailable)
     }
 }
 
@@ -343,11 +565,184 @@ impl HasDisplayHandle for OhosWindow {
     fn display_handle(
         &self,
     ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
-        // Create a dummy display handle for OHOS
-        // In a real implementation, this would come from the native window
-        let handle = raw_window_handle::OhosDisplayHandle::new();
-        let raw_handle = raw_window_handle::RawDisplayHandle::Ohos(handle);
-        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(raw_handle) })
+        Err(raw_window_handle::HandleError::Unavailable)
+    }
+}
+
+impl HasDisplayHandle for OhosWindowHandle {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Err(raw_window_handle::HandleError::Unavailable)
+    }
+}
+
+impl PlatformWindow for OhosWindowHandle {
+    fn bounds(&self) -> Bounds<Pixels> {
+        self.with_window(|window| window.bounds())
+    }
+
+    fn is_maximized(&self) -> bool {
+        self.with_window(|window| window.is_maximized())
+    }
+
+    fn window_bounds(&self) -> WindowBounds {
+        self.with_window(|window| window.window_bounds())
+    }
+
+    fn content_size(&self) -> Size<Pixels> {
+        self.with_window(|window| window.content_size())
+    }
+
+    fn resize(&mut self, size: Size<Pixels>) {
+        self.with_window_mut(|window| window.resize(size))
+    }
+
+    fn scale_factor(&self) -> f32 {
+        self.with_window(|window| window.scale_factor())
+    }
+
+    fn appearance(&self) -> WindowAppearance {
+        self.with_window(|window| window.appearance())
+    }
+
+    fn display(&self) -> Option<Rc<dyn PlatformDisplay>> {
+        self.with_window(|window| window.display())
+    }
+
+    fn mouse_position(&self) -> Point<Pixels> {
+        self.with_window(|window| window.mouse_position())
+    }
+
+    fn modifiers(&self) -> Modifiers {
+        self.with_window(|window| window.modifiers())
+    }
+
+    fn capslock(&self) -> Capslock {
+        self.with_window(|window| window.capslock())
+    }
+
+    fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
+        *self.input_handler.borrow_mut() = Some(input_handler);
+        self.with_window(|window| window.show_keyboard_if_needed());
+        self.with_window(|window| window.try_reopen_keyboard_from_pending());
+    }
+
+    fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
+        self.input_handler.borrow_mut().take()
+    }
+
+    fn prompt(
+        &self,
+        level: PromptLevel,
+        msg: &str,
+        detail: Option<&str>,
+        answers: &[PromptButton],
+    ) -> Option<oneshot::Receiver<usize>> {
+        self.with_window(|window| window.prompt(level, msg, detail, answers))
+    }
+
+    fn activate(&self) {
+        self.with_window(|window| window.activate())
+    }
+
+    fn is_active(&self) -> bool {
+        self.with_window(|window| window.is_active())
+    }
+
+    fn is_hovered(&self) -> bool {
+        self.with_window(|window| window.is_hovered())
+    }
+
+    fn set_title(&mut self, title: &str) {
+        self.with_window_mut(|window| window.set_title(title))
+    }
+
+    fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
+        self.with_window(|window| window.set_background_appearance(background_appearance))
+    }
+
+    fn minimize(&self) {
+        self.with_window(|window| window.minimize())
+    }
+
+    fn zoom(&self) {
+        self.with_window(|window| window.zoom())
+    }
+
+    fn toggle_fullscreen(&self) {
+        self.with_window(|window| window.toggle_fullscreen())
+    }
+
+    fn is_fullscreen(&self) -> bool {
+        self.with_window(|window| window.is_fullscreen())
+    }
+
+    fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
+        self.with_window(|window| window.on_request_frame(callback))
+    }
+
+    fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> crate::DispatchEventResult>) {
+        self.with_window(|window| window.on_input(callback))
+    }
+
+    fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>) {
+        self.with_window(|window| window.on_active_status_change(callback))
+    }
+
+    fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>) {
+        self.with_window(|window| window.on_hover_status_change(callback))
+    }
+
+    fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>) {
+        self.with_window(|window| window.on_resize(callback))
+    }
+
+    fn on_moved(&self, callback: Box<dyn FnMut()>) {
+        self.with_window(|window| window.on_moved(callback))
+    }
+
+    fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>) {
+        self.with_window(|window| window.on_should_close(callback))
+    }
+
+    fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
+        self.with_window(|window| window.on_hit_test_window_control(callback))
+    }
+
+    fn on_close(&self, callback: Box<dyn FnOnce()>) {
+        self.with_window(|window| window.on_close(callback))
+    }
+
+    fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
+        self.with_window(|window| window.on_appearance_changed(callback))
+    }
+
+    fn draw(&self, scene: &Scene) {
+        self.with_window(|window| window.draw(scene))
+    }
+
+    fn completed_frame(&self) {
+        if self.input_handler.borrow().is_none() {
+            self.with_window(|window| {
+                window.keyboard_suppressed.set(false);
+                window.pending_reopen_position.borrow_mut().take();
+                window.hide_keyboard_if_needed();
+            });
+        }
+        self.with_window(|window| window.completed_frame())
+    }
+
+    fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+        self.with_window(|window| window.sprite_atlas())
+    }
+
+    fn gpu_specs(&self) -> Option<GpuSpecs> {
+        self.with_window(|window| window.gpu_specs())
+    }
+
+    fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+        self.with_window(|window| window.update_ime_position(bounds))
     }
 }
 
@@ -403,6 +798,8 @@ impl PlatformWindow for OhosWindow {
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
         *self.input_handler.borrow_mut() = Some(input_handler);
+        self.show_keyboard_if_needed();
+        self.try_reopen_keyboard_from_pending();
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
@@ -500,7 +897,7 @@ impl PlatformWindow for OhosWindow {
         // This ensures native_window is available (after SurfaceCreate event)
         if self.renderer.borrow().is_none() {
             if let Err(e) = self.initialize_renderer() {
-                hilog_warn!("OhosWindow: Failed to initialize renderer in draw(): {}", e);
+                warn!("OhosWindow: Failed to initialize renderer in draw(): {}", e);
                 return;
             }
         }
@@ -510,16 +907,9 @@ impl PlatformWindow for OhosWindow {
             let batch_count = scene.batches().count();
             let bounds = *self.bounds.borrow();
             let scale = *self.scale.borrow();
-            hilog_debug!(
-                "OhosWindow: draw called with {} batches, bounds: {:?}, scale: {}",
-                batch_count,
-                bounds,
-                scale
-            );
-
             renderer.draw(scene);
         } else {
-            hilog_warn!("OhosWindow: draw called but renderer is not available");
+            warn!("OhosWindow: draw called but renderer is not available");
         }
     }
 
@@ -531,7 +921,7 @@ impl PlatformWindow for OhosWindow {
             // Try to initialize renderer lazily; if it still fails, return dummy atlas with error.
             if self.renderer.borrow().is_none() {
                 if let Err(err) = self.initialize_renderer() {
-                    hilog_warn!(
+                    warn!(
                         "OhosWindow: Failed to initialize renderer when fetching atlas: {}",
                         err
                     );

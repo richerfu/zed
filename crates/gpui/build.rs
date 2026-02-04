@@ -56,7 +56,10 @@ fn check_wgsl_shaders_for_ohos() {
     let shader_source = match std::fs::read_to_string(&shader_path) {
         Ok(s) => s,
         Err(e) => {
-            println!("cargo::warning=Could not read WGSL shader file for OHOS: {}", e);
+            println!(
+                "cargo::warning=Could not read WGSL shader file for OHOS: {}",
+                e
+            );
             return;
         }
     };
@@ -66,7 +69,10 @@ fn check_wgsl_shaders_for_ohos() {
             // Shader is valid
         }
         Err(e) => {
-            println!("cargo::error=WGSL shader compilation failed for OHOS:\n{}", e);
+            println!(
+                "cargo::error=WGSL shader compilation failed for OHOS:\n{}",
+                e
+            );
             process::exit(1);
         }
     }

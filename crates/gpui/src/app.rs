@@ -181,10 +181,8 @@ impl Application {
     /// This should be called before `run()` to ensure the app is available when the platform initializes.
     #[cfg(target_env = "ohos")]
     pub fn with_ohos_app(self, app: openharmony_ability::OpenHarmonyApp) -> Self {
-        // Store the app in a global location that OhosPlatform can access
-        // This is a workaround since we can't easily downcast Rc<dyn Platform>
-        use crate::platform::set_ohos_app_global;
-        set_ohos_app_global(app);
+        let platform = self.0.borrow().platform.clone();
+        platform.set_ohos_app(app);
         self
     }
 
@@ -195,15 +193,7 @@ impl Application {
         F: 'static + FnOnce(&mut App),
     {
         let this = self.0.clone();
-        
-        #[cfg(target_env = "ohos")]
-        {
-            // Set the GPUI app weak reference before running the platform
-            // This ensures handle_ohos_event can access the app instance when Ability lifecycle events fire
-            use crate::platform::set_gpui_app_weak;
-            set_gpui_app_weak(Rc::downgrade(&this));
-        }
-        
+
         let platform = this.borrow().platform.clone();
         platform.run(Box::new(move || {
             let cx = &mut *this.borrow_mut();

@@ -1,6 +1,5 @@
 // todo("windows"): remove
 #![cfg_attr(windows, allow(dead_code))]
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 

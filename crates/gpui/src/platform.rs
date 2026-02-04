@@ -96,8 +96,6 @@ pub(crate) use windows::*;
 
 #[cfg(target_env = "ohos")]
 pub(crate) use ohos::*;
-#[cfg(target_env = "ohos")]
-pub use ohos::{set_gpui_app_weak, set_ohos_app_global};
 
 #[cfg(all(target_os = "linux", not(target_env = "ohos"), feature = "wayland"))]
 pub use linux::layer_shell;
@@ -247,6 +245,9 @@ pub(crate) trait Platform: 'static {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>>;
+
+    #[cfg(target_env = "ohos")]
+    fn set_ohos_app(&self, _app: openharmony_ability::OpenHarmonyApp) {}
 
     /// Returns the appearance of the application's windows.
     fn window_appearance(&self) -> WindowAppearance;
@@ -937,7 +938,7 @@ impl<T> AtlasTextureList<T> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub(crate) struct AtlasTile {
     pub(crate) texture_id: AtlasTextureId,

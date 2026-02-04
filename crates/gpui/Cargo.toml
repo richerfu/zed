@@ -247,7 +247,6 @@ openharmony-ability = { git = "https://github.com/harmony-contrib/openharmony-ab
 openharmony-ability-derive = { git = "https://github.com/harmony-contrib/openharmony-ability.git" }
 napi-ohos = { version = "1.1" }
 napi-derive-ohos = { version = "1.1" }
-ohos-hilog-binding = "0.1.2"
 flume = "0.11"
 # Blade renderer dependencies for GLES backend
 blade-graphics.workspace = true
