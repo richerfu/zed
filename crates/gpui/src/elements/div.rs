@@ -2542,7 +2542,9 @@ impl Interactivity {
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                let should_handle = hitbox.should_handle_scroll(window)
+                    || (cfg!(target_env = "ohos") && hitbox.bounds.contains(&event.position));
+                if phase == DispatchPhase::Bubble && should_handle {
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
                     let delta = event.delta.pixel_delta(line_height);

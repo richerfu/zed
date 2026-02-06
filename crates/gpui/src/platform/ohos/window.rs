@@ -22,9 +22,9 @@ use crate::{
     AnyWindowHandle, Bounds, Capslock, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
-    WindowParams, point, px, size,
+    PromptLevel, RequestFrameOptions, ResizeEdge, Scene, ScrollDelta, ScrollWheelEvent, Size,
+    TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowControls, WindowDecorations, WindowParams, point, px, size,
 };
 use blade_graphics as gpu;
 
@@ -43,6 +43,8 @@ pub(crate) struct OhosWindow {
     keyboard_visible: Rc<Cell<bool>>,
     keyboard_suppressed: Rc<Cell<bool>>,
     pending_reopen_position: Rc<RefCell<Option<Point<Pixels>>>>,
+    last_touch_position: RefCell<Option<Point<Pixels>>>,
+    touch_active: Cell<bool>,
 }
 
 pub(crate) struct OhosWindowHandle {
@@ -126,6 +128,8 @@ impl OhosWindow {
             keyboard_visible: Rc::new(Cell::new(false)),
             keyboard_suppressed: Rc::new(Cell::new(false)),
             pending_reopen_position: Rc::new(RefCell::new(None)),
+            last_touch_position: RefCell::new(None),
+            touch_active: Cell::new(false),
         })
     }
 
@@ -437,6 +441,8 @@ impl OhosWindow {
                 let modifiers = Modifiers::default();
                 let input = match touch_event.event_type {
                     TouchEvent::Down => {
+                        self.touch_active.set(true);
+                        *self.last_touch_position.borrow_mut() = Some(position);
                         self.handle_touch_focus(position);
                         self.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
                             position,
@@ -462,6 +468,29 @@ impl OhosWindow {
                             .touch_points
                             .iter()
                             .any(|point| point.is_pressed);
+
+                        if !self.touch_active.get() {
+                            self.touch_active.set(true);
+                            *self.last_touch_position.borrow_mut() = Some(position);
+                        }
+
+                        if self.touch_active.get() {
+                            if let Some(last) = *self.last_touch_position.borrow() {
+                                let delta = point(position.x - last.x, position.y - last.y);
+                                if delta.x.0 != 0.0 || delta.y.0 != 0.0 {
+                                    self.dispatch_input(PlatformInput::ScrollWheel(
+                                        ScrollWheelEvent {
+                                            position,
+                                            delta: ScrollDelta::Pixels(delta),
+                                            modifiers,
+                                            touch_phase: TouchPhase::Moved,
+                                        },
+                                    ));
+                                }
+                            }
+                            *self.last_touch_position.borrow_mut() = Some(position);
+                        }
+
                         PlatformInput::MouseMove(MouseMoveEvent {
                             position,
                             pressed_button: pressed.then_some(MouseButton::Left),
@@ -469,9 +498,16 @@ impl OhosWindow {
                         })
                     }
                     TouchEvent::Cancel | TouchEvent::Unknown => {
+                        self.touch_active.set(false);
+                        *self.last_touch_position.borrow_mut() = None;
                         return;
                     }
                 };
+
+                if matches!(touch_event.event_type, TouchEvent::Up) {
+                    self.touch_active.set(false);
+                    *self.last_touch_position.borrow_mut() = None;
+                }
 
                 self.dispatch_input(input);
             }

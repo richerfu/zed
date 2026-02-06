@@ -1019,6 +1019,8 @@ struct ShadowVarying {
     @location(3) clip_distances: vec4<f32>,
     @location(4) @interpolate(flat) corner_radii: vec4<f32>,
     @location(5) @interpolate(flat) blur_radius: f32,
+    @location(6) @interpolate(flat) shape_origin: vec2<f32>,
+    @location(7) @interpolate(flat) shape_size: vec2<f32>,
 }
 
 @vertex
@@ -1052,6 +1054,8 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, shadow_input: ShadowVertexIn
     out.corner_radii = shadow_input.corner_radii;
     out.blur_radius = blur_radius;
     out.clip_distances = distance_from_clip_rect(unit_vertex, bounds, content_mask);
+    out.shape_origin = shadow_input.bounds_origin;
+    out.shape_size = shadow_input.bounds_size;
     return out;
 }
 
@@ -1068,27 +1072,34 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     corner_radii.bottom_right = input.corner_radii.z;
     corner_radii.bottom_left = input.corner_radii.w;
     
-    let half_size = input.bounds_size / 2.0;
-    let center = input.bounds_origin + half_size;
-    let center_to_point = input.position.xy - center;
+    let origin = input.shape_origin;
+    let size = input.shape_size;
+    let half_size = size / 2.0;
+    let center = origin + half_size;
+    let point = input.position.xy - center;
+    let corner_radius = pick_corner_radius(point, corner_radii);
 
-    let corner_radius = pick_corner_radius(center_to_point, corner_radii);
+    var alpha: f32;
+    if (input.blur_radius == 0.0) {
+        let bounds = Bounds(origin, size);
+        let distance = quad_sdf(input.position.xy, bounds, corner_radii);
+        alpha = saturate(0.5 - distance);
+    } else {
+        // The signal is only non-zero in a limited range, so don't waste samples
+        let low = point.y - half_size.y;
+        let high = point.y + half_size.y;
+        let start = clamp(-3.0 * input.blur_radius, low, high);
+        let end = clamp(3.0 * input.blur_radius, low, high);
 
-    // The signal is only non-zero in a limited range, so don't waste samples
-    let low = center_to_point.y - half_size.y;
-    let high = center_to_point.y + half_size.y;
-    let start = clamp(-3.0 * input.blur_radius, low, high);
-    let end = clamp(3.0 * input.blur_radius, low, high);
-
-    // Accumulate samples (we can get away with surprisingly few samples)
-    let step = (end - start) / 4.0;
-    var y = start + step * 0.5;
-    var alpha = 0.0;
-    for (var i = 0; i < 4; i += 1) {
-        let blur = blur_along_x(center_to_point.x, center_to_point.y - y,
-            input.blur_radius, corner_radius, half_size);
-        alpha +=  blur * gaussian(y, input.blur_radius) * step;
-        y += step;
+        // Accumulate samples (match mac behavior)
+        let step = (end - start) / 4.0;
+        var y = start + step * 0.5;
+        alpha = 0.0;
+        for (var i = 0; i < 4; i += 1) {
+            alpha += blur_along_x(point.x, point.y - y, input.blur_radius,
+                corner_radius, half_size) * gaussian(y, input.blur_radius) * step;
+            y += step;
+        }
     }
 
     return blend_color(input.color, alpha);
