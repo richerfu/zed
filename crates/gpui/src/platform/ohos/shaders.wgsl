@@ -1077,12 +1077,18 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     let half_size = size / 2.0;
     let center = origin + half_size;
     let point = input.position.xy - center;
-    let corner_radius = pick_corner_radius(point, corner_radii);
+    let max_corner = min(half_size.x, half_size.y);
+    var clamped_corner_radii = corner_radii;
+    clamped_corner_radii.top_left = min(clamped_corner_radii.top_left, max_corner);
+    clamped_corner_radii.top_right = min(clamped_corner_radii.top_right, max_corner);
+    clamped_corner_radii.bottom_right = min(clamped_corner_radii.bottom_right, max_corner);
+    clamped_corner_radii.bottom_left = min(clamped_corner_radii.bottom_left, max_corner);
+    let corner_radius = min(pick_corner_radius(point, clamped_corner_radii), max_corner);
 
     var alpha: f32;
     if (input.blur_radius == 0.0) {
         let bounds = Bounds(origin, size);
-        let distance = quad_sdf(input.position.xy, bounds, corner_radii);
+        let distance = quad_sdf(input.position.xy, bounds, clamped_corner_radii);
         alpha = saturate(0.5 - distance);
     } else {
         // The signal is only non-zero in a limited range, so don't waste samples
