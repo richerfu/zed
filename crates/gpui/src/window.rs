@@ -875,6 +875,8 @@ pub struct Window {
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
+    #[cfg(target_env = "ohos")]
+    virtual_keyboard_dismissed_by_user: bool,
     pub(crate) needs_present: Rc<Cell<bool>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
@@ -1203,9 +1205,23 @@ impl Window {
                             .retain(&(), |callback| callback(window, cx));
 
                         window.bounds_changed(cx);
+                        #[cfg(target_env = "ohos")]
+                        window.update_virtual_keyboard_visibility(cx);
                         window.refresh();
 
                         SystemWindowTabController::update_last_active(cx, window.handle.id);
+                    })
+                    .log_err();
+            }
+        }));
+        #[cfg(target_env = "ohos")]
+        platform_window.on_virtual_keyboard_hidden_by_user(Box::new({
+            let mut cx = cx.to_async();
+            move || {
+                handle
+                    .update(&mut cx, |_, window, cx| {
+                        window.virtual_keyboard_dismissed_by_user = true;
+                        window.update_virtual_keyboard_visibility(cx);
                     })
                     .log_err();
             }
@@ -1344,6 +1360,8 @@ impl Window {
             appearance_observers: SubscriberSet::new(),
             active,
             hovered,
+            #[cfg(target_env = "ohos")]
+            virtual_keyboard_dismissed_by_user: false,
             needs_present,
             input_rate_tracker,
             last_input_modality: InputModality::Mouse,
@@ -1483,7 +1501,22 @@ impl Window {
 
     /// Move focus to the element associated with the given [`FocusHandle`].
     pub fn focus(&mut self, handle: &FocusHandle, cx: &mut App) {
-        if !self.focus_enabled || self.focus == Some(handle.id) {
+        if !self.focus_enabled {
+            return;
+        }
+
+        #[cfg(target_env = "ohos")]
+        {
+            self.virtual_keyboard_dismissed_by_user = false;
+
+            if self.focus == Some(handle.id) {
+                self.update_virtual_keyboard_visibility(cx);
+                return;
+            }
+        }
+
+        #[cfg(not(target_env = "ohos"))]
+        if self.focus == Some(handle.id) {
             return;
         }
 
@@ -1511,7 +1544,35 @@ impl Window {
         }
 
         self.focus = None;
+        #[cfg(target_env = "ohos")]
+        self.update_virtual_keyboard_visibility_for_current_state();
         self.refresh();
+    }
+
+    #[cfg(target_env = "ohos")]
+    fn update_virtual_keyboard_visibility(&mut self, cx: &mut App) {
+        let has_text_input_focus =
+            self.platform_window
+                .take_input_handler()
+                .map_or(false, |mut input_handler| {
+                    let accepts = input_handler.accepts_text_input(self, cx);
+                    self.platform_window.set_input_handler(input_handler);
+                    accepts
+                });
+        let should_show = self.active.get()
+            && self.focus.is_some()
+            && has_text_input_focus
+            && !self.virtual_keyboard_dismissed_by_user;
+        self.platform_window
+            .set_virtual_keyboard_visible(should_show);
+    }
+
+    #[cfg(target_env = "ohos")]
+    fn update_virtual_keyboard_visibility_for_current_state(&mut self) {
+        let should_show =
+            self.active.get() && self.focus.is_some() && !self.virtual_keyboard_dismissed_by_user;
+        self.platform_window
+            .set_virtual_keyboard_visible(should_show);
     }
 
     /// Blur the window and don't allow anything in it to be focused again.
@@ -2084,6 +2145,8 @@ impl Window {
         if let Some(input_handler) = self.next_frame.input_handlers.pop() {
             self.platform_window
                 .set_input_handler(input_handler.unwrap());
+            #[cfg(target_env = "ohos")]
+            self.update_virtual_keyboard_visibility(cx);
         }
 
         self.layout_engine.as_mut().unwrap().clear();

@@ -41,8 +41,6 @@ pub(crate) struct OhosWindow {
     gpu_context: Arc<BladeContext>,
     foreground_executor: ForegroundExecutor,
     keyboard_visible: Rc<Cell<bool>>,
-    keyboard_suppressed: Rc<Cell<bool>>,
-    pending_reopen_position: Rc<RefCell<Option<Point<Pixels>>>>,
     last_touch_position: RefCell<Option<Point<Pixels>>>,
     touch_active: Cell<bool>,
 }
@@ -76,6 +74,7 @@ struct WindowCallbacks {
     request_frame: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     input: Option<Box<dyn FnMut(PlatformInput) -> crate::DispatchEventResult>>,
     active_status_change: Option<Box<dyn FnMut(bool)>>,
+    virtual_keyboard_hidden_by_user: Option<Box<dyn FnMut()>>,
     hover_status_change: Option<Box<dyn FnMut(bool)>>,
     resize: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved: Option<Box<dyn FnMut()>>,
@@ -114,6 +113,7 @@ impl OhosWindow {
                 request_frame: None,
                 input: None,
                 active_status_change: None,
+                virtual_keyboard_hidden_by_user: None,
                 hover_status_change: None,
                 resize: None,
                 moved: None,
@@ -126,15 +126,13 @@ impl OhosWindow {
             gpu_context,
             foreground_executor,
             keyboard_visible: Rc::new(Cell::new(false)),
-            keyboard_suppressed: Rc::new(Cell::new(false)),
-            pending_reopen_position: Rc::new(RefCell::new(None)),
             last_touch_position: RefCell::new(None),
             touch_active: Cell::new(false),
         })
     }
 
     fn show_keyboard_if_needed(&self) {
-        if !self.keyboard_visible.get() && !self.keyboard_suppressed.get() {
+        if !self.keyboard_visible.get() {
             if let Some(app) = self.app.borrow().as_ref() {
                 app.show_keyboard();
                 self.keyboard_visible.set(true);
@@ -329,8 +327,6 @@ impl OhosWindow {
                     cb(false);
                 }
                 self.callbacks.borrow_mut().active_status_change = callback;
-                self.keyboard_suppressed.set(false);
-                self.pending_reopen_position.borrow_mut().take();
                 self.hide_keyboard_if_needed();
             }
             Event::ConfigChanged(..) => {
@@ -368,11 +364,17 @@ impl OhosWindow {
             Event::KeyboardEvent(height) => {
                 if *height <= 0 {
                     self.keyboard_visible.set(false);
-                    self.keyboard_suppressed.set(true);
+                    let mut callback = self
+                        .callbacks
+                        .borrow_mut()
+                        .virtual_keyboard_hidden_by_user
+                        .take();
+                    if let Some(ref mut cb) = callback {
+                        cb();
+                    }
+                    self.callbacks.borrow_mut().virtual_keyboard_hidden_by_user = callback;
                 } else {
                     self.keyboard_visible.set(true);
-                    self.keyboard_suppressed.set(false);
-                    self.pending_reopen_position.borrow_mut().take();
                 }
             }
             _ => {}
@@ -386,7 +388,6 @@ impl OhosWindow {
                 let ime_event = ime_event.clone();
                 let executor = self.foreground_executor.clone();
                 let keyboard_visible = self.keyboard_visible.clone();
-                let keyboard_suppressed = self.keyboard_suppressed.clone();
 
                 executor
                     .spawn(async move {
@@ -428,7 +429,6 @@ impl OhosWindow {
                                 {
                                     handler.unmark_text();
                                     keyboard_visible.set(false);
-                                    keyboard_suppressed.set(true);
                                 }
                             }
                         }
@@ -443,7 +443,6 @@ impl OhosWindow {
                     TouchEvent::Down => {
                         self.touch_active.set(true);
                         *self.last_touch_position.borrow_mut() = Some(position);
-                        self.handle_touch_focus(position);
                         self.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
                             position,
                             pressed_button: None,
@@ -512,49 +511,6 @@ impl OhosWindow {
                 self.dispatch_input(input);
             }
             _ => {}
-        }
-    }
-
-    fn handle_touch_focus(&self, position: Point<Pixels>) {
-        if !self.keyboard_suppressed.get() || self.keyboard_visible.get() {
-            return;
-        }
-
-        let mut handler_guard = self.input_handler.borrow_mut();
-        let Some(handler) = handler_guard.as_mut() else {
-            return;
-        };
-
-        if handler.character_index_for_point(position).is_some() {
-            // User tapped inside the currently focused input: allow keyboard to re-open.
-            self.keyboard_suppressed.set(false);
-            self.pending_reopen_position.borrow_mut().take();
-            self.show_keyboard_if_needed();
-        } else {
-            // Tap outside current input while keyboard is hidden; defer decision until
-            // after focus updates, in case another input becomes focused.
-            *self.pending_reopen_position.borrow_mut() = Some(position);
-        }
-    }
-
-    fn try_reopen_keyboard_from_pending(&self) {
-        let position = self.pending_reopen_position.borrow_mut().take();
-        let Some(position) = position else {
-            return;
-        };
-
-        if !self.keyboard_suppressed.get() || self.keyboard_visible.get() {
-            return;
-        }
-
-        let mut handler_guard = self.input_handler.borrow_mut();
-        let Some(handler) = handler_guard.as_mut() else {
-            return;
-        };
-
-        if handler.character_index_for_point(position).is_some() {
-            self.keyboard_suppressed.set(false);
-            self.show_keyboard_if_needed();
         }
     }
 
@@ -660,8 +616,6 @@ impl PlatformWindow for OhosWindowHandle {
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
         *self.input_handler.borrow_mut() = Some(input_handler);
-        self.with_window(|window| window.show_keyboard_if_needed());
-        self.with_window(|window| window.try_reopen_keyboard_from_pending());
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
@@ -726,8 +680,27 @@ impl PlatformWindow for OhosWindowHandle {
         self.with_window(|window| window.on_active_status_change(callback))
     }
 
+    fn on_virtual_keyboard_hidden_by_user(&self, callback: Box<dyn FnMut()>) {
+        self.with_window(|window| {
+            window
+                .callbacks
+                .borrow_mut()
+                .virtual_keyboard_hidden_by_user = Some(callback)
+        })
+    }
+
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>) {
         self.with_window(|window| window.on_hover_status_change(callback))
+    }
+
+    fn set_virtual_keyboard_visible(&self, visible: bool) {
+        self.with_window(|window| {
+            if visible {
+                window.show_keyboard_if_needed();
+            } else {
+                window.hide_keyboard_if_needed();
+            }
+        })
     }
 
     fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>) {
@@ -760,11 +733,7 @@ impl PlatformWindow for OhosWindowHandle {
 
     fn completed_frame(&self) {
         if self.input_handler.borrow().is_none() {
-            self.with_window(|window| {
-                window.keyboard_suppressed.set(false);
-                window.pending_reopen_position.borrow_mut().take();
-                window.hide_keyboard_if_needed();
-            });
+            self.with_window(|window| window.hide_keyboard_if_needed());
         }
         self.with_window(|window| window.completed_frame())
     }
@@ -834,8 +803,6 @@ impl PlatformWindow for OhosWindow {
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
         *self.input_handler.borrow_mut() = Some(input_handler);
-        self.show_keyboard_if_needed();
-        self.try_reopen_keyboard_from_pending();
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
@@ -900,8 +867,20 @@ impl PlatformWindow for OhosWindow {
         self.callbacks.borrow_mut().active_status_change = Some(callback);
     }
 
+    fn on_virtual_keyboard_hidden_by_user(&self, callback: Box<dyn FnMut()>) {
+        self.callbacks.borrow_mut().virtual_keyboard_hidden_by_user = Some(callback);
+    }
+
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>) {
         self.callbacks.borrow_mut().hover_status_change = Some(callback);
+    }
+
+    fn set_virtual_keyboard_visible(&self, visible: bool) {
+        if visible {
+            self.show_keyboard_if_needed();
+        } else {
+            self.hide_keyboard_if_needed();
+        }
     }
 
     fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>) {
