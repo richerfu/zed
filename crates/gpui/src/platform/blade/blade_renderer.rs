@@ -727,6 +727,18 @@ pub struct BladeRenderer {
     path_intermediate_msaa_texture: Option<gpu::Texture>,
     path_intermediate_msaa_texture_view: Option<gpu::TextureView>,
     rendering_parameters: RenderingParameters,
+    path_rasterization_vertices: Vec<PathRasterizationVertex>,
+    path_sprites: Vec<PathSprite>,
+    #[cfg(target_env = "ohos")]
+    gpu_quads: Vec<GpuQuad>,
+    #[cfg(target_env = "ohos")]
+    gpu_shadows: Vec<GpuShadow>,
+    #[cfg(target_env = "ohos")]
+    gpu_underlines: Vec<GpuUnderline>,
+    #[cfg(target_env = "ohos")]
+    gpu_mono_sprites: Vec<GpuMonochromeSprite>,
+    #[cfg(target_env = "ohos")]
+    gpu_poly_sprites: Vec<GpuPolychromeSprite>,
 }
 
 impl BladeRenderer {
@@ -823,6 +835,18 @@ impl BladeRenderer {
             path_intermediate_msaa_texture,
             path_intermediate_msaa_texture_view,
             rendering_parameters,
+            path_rasterization_vertices: Vec::new(),
+            path_sprites: Vec::new(),
+            #[cfg(target_env = "ohos")]
+            gpu_quads: Vec::new(),
+            #[cfg(target_env = "ohos")]
+            gpu_shadows: Vec::new(),
+            #[cfg(target_env = "ohos")]
+            gpu_underlines: Vec::new(),
+            #[cfg(target_env = "ohos")]
+            gpu_mono_sprites: Vec::new(),
+            #[cfg(target_env = "ohos")]
+            gpu_poly_sprites: Vec::new(),
         })
     }
 
@@ -996,17 +1020,24 @@ impl BladeRenderer {
             };
             let mut encoder = pass.with(&self.pipelines.path_rasterization);
 
-            let mut vertices = Vec::new();
+            let total_vertices = paths.iter().map(|path| path.vertices.len()).sum();
+            self.path_rasterization_vertices.clear();
+            self.path_rasterization_vertices.reserve(total_vertices);
             for path in paths {
-                vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
-                    xy_position: v.xy_position,
-                    st_position: v.st_position,
-                    color: path.color,
-                    bounds: path.clipped_bounds(),
-                }));
+                let bounds = path.clipped_bounds();
+                self.path_rasterization_vertices
+                    .extend(path.vertices.iter().map(|v| PathRasterizationVertex {
+                        xy_position: v.xy_position,
+                        st_position: v.st_position,
+                        color: path.color,
+                        bounds,
+                    }));
             }
-            let vertex_buf =
-                Self::alloc_instance_buffer(&mut self.instance_belt, &self.gpu, &vertices);
+            let vertex_buf = Self::alloc_instance_buffer(
+                &mut self.instance_belt,
+                &self.gpu,
+                &self.path_rasterization_vertices,
+            );
             #[cfg(target_env = "ohos")]
             {
                 encoder.bind(0, &ShaderPathRasterizationData { globals });
@@ -1020,7 +1051,7 @@ impl BladeRenderer {
                     b_path_vertices: vertex_buf,
                 },
             );
-            encoder.draw(0, vertices.len() as u32, 0, 1);
+            encoder.draw(0, self.path_rasterization_vertices.len() as u32, 0, 1);
         }
     }
 
@@ -1082,10 +1113,17 @@ impl BladeRenderer {
             match batch {
                 PrimitiveBatch::Quads(quads) => {
                     #[cfg(target_env = "ohos")]
-                    let gpu_quads: Vec<GpuQuad> = quads.iter().map(GpuQuad::from).collect();
+                    {
+                        self.gpu_quads.clear();
+                        self.gpu_quads.reserve(quads.len());
+                        self.gpu_quads.extend(quads.iter().map(GpuQuad::from));
+                    }
                     #[cfg(target_env = "ohos")]
-                    let instance_buf =
-                        Self::alloc_instance_buffer(&mut self.instance_belt, &self.gpu, &gpu_quads);
+                    let instance_buf = Self::alloc_instance_buffer(
+                        &mut self.instance_belt,
+                        &self.gpu,
+                        &self.gpu_quads,
+                    );
                     #[cfg(not(target_env = "ohos"))]
                     let instance_buf =
                         Self::alloc_instance_buffer(&mut self.instance_belt, &self.gpu, quads);
@@ -1107,12 +1145,16 @@ impl BladeRenderer {
                 }
                 PrimitiveBatch::Shadows(shadows) => {
                     #[cfg(target_env = "ohos")]
-                    let gpu_shadows: Vec<GpuShadow> = shadows.iter().map(GpuShadow::from).collect();
+                    {
+                        self.gpu_shadows.clear();
+                        self.gpu_shadows.reserve(shadows.len());
+                        self.gpu_shadows.extend(shadows.iter().map(GpuShadow::from));
+                    }
                     #[cfg(target_env = "ohos")]
                     let instance_buf = Self::alloc_instance_buffer(
                         &mut self.instance_belt,
                         &self.gpu,
-                        &gpu_shadows,
+                        &self.gpu_shadows,
                     );
                     #[cfg(not(target_env = "ohos"))]
                     let instance_buf =
@@ -1162,22 +1204,25 @@ impl BladeRenderer {
                     // disjoint, so we can copy each path's bounds individually. If this
                     // batch combines different draw orders, we perform a single copy
                     // for a minimal spanning rect.
-                    let sprites = if paths.last().unwrap().order == first_path.order {
-                        paths
-                            .iter()
-                            .map(|path| PathSprite {
+                    self.path_sprites.clear();
+                    if paths.last().unwrap().order == first_path.order {
+                        self.path_sprites.reserve(paths.len());
+                        self.path_sprites
+                            .extend(paths.iter().map(|path| PathSprite {
                                 bounds: path.clipped_bounds(),
-                            })
-                            .collect()
+                            }));
                     } else {
                         let mut bounds = first_path.clipped_bounds();
                         for path in paths.iter().skip(1) {
                             bounds = bounds.union(&path.clipped_bounds());
                         }
-                        vec![PathSprite { bounds }]
-                    };
-                    let instance_buf =
-                        Self::alloc_instance_buffer(&mut self.instance_belt, &self.gpu, &sprites);
+                        self.path_sprites.push(PathSprite { bounds });
+                    }
+                    let instance_buf = Self::alloc_instance_buffer(
+                        &mut self.instance_belt,
+                        &self.gpu,
+                        &self.path_sprites,
+                    );
                     #[cfg(target_env = "ohos")]
                     {
                         encoder.bind(
@@ -1200,17 +1245,21 @@ impl BladeRenderer {
                             b_path_sprites: instance_buf,
                         },
                     );
-                    encoder.draw(0, 4, 0, sprites.len() as u32);
+                    encoder.draw(0, 4, 0, self.path_sprites.len() as u32);
                 }
                 PrimitiveBatch::Underlines(underlines) => {
                     #[cfg(target_env = "ohos")]
-                    let gpu_underlines: Vec<GpuUnderline> =
-                        underlines.iter().map(GpuUnderline::from).collect();
+                    {
+                        self.gpu_underlines.clear();
+                        self.gpu_underlines.reserve(underlines.len());
+                        self.gpu_underlines
+                            .extend(underlines.iter().map(GpuUnderline::from));
+                    }
                     #[cfg(target_env = "ohos")]
                     let instance_buf = Self::alloc_instance_buffer(
                         &mut self.instance_belt,
                         &self.gpu,
-                        &gpu_underlines,
+                        &self.gpu_underlines,
                     );
                     #[cfg(not(target_env = "ohos"))]
                     let instance_buf =
@@ -1237,13 +1286,17 @@ impl BladeRenderer {
                 } => {
                     let tex_info = self.atlas.get_texture_info(texture_id);
                     #[cfg(target_env = "ohos")]
-                    let gpu_sprites: Vec<GpuMonochromeSprite> =
-                        sprites.iter().map(GpuMonochromeSprite::from).collect();
+                    {
+                        self.gpu_mono_sprites.clear();
+                        self.gpu_mono_sprites.reserve(sprites.len());
+                        self.gpu_mono_sprites
+                            .extend(sprites.iter().map(GpuMonochromeSprite::from));
+                    }
                     #[cfg(target_env = "ohos")]
                     let instance_buf = Self::alloc_instance_buffer(
                         &mut self.instance_belt,
                         &self.gpu,
-                        &gpu_sprites,
+                        &self.gpu_mono_sprites,
                     );
                     #[cfg(not(target_env = "ohos"))]
                     let instance_buf =
@@ -1287,13 +1340,17 @@ impl BladeRenderer {
                 } => {
                     let tex_info = self.atlas.get_texture_info(texture_id);
                     #[cfg(target_env = "ohos")]
-                    let gpu_sprites: Vec<GpuPolychromeSprite> =
-                        sprites.iter().map(GpuPolychromeSprite::from).collect();
+                    {
+                        self.gpu_poly_sprites.clear();
+                        self.gpu_poly_sprites.reserve(sprites.len());
+                        self.gpu_poly_sprites
+                            .extend(sprites.iter().map(GpuPolychromeSprite::from));
+                    }
                     #[cfg(target_env = "ohos")]
                     let instance_buf = Self::alloc_instance_buffer(
                         &mut self.instance_belt,
                         &self.gpu,
-                        &gpu_sprites,
+                        &self.gpu_poly_sprites,
                     );
                     #[cfg(not(target_env = "ohos"))]
                     let instance_buf =
@@ -1523,7 +1580,12 @@ impl RenderingParameters {
             .ok()
             .and_then(|v| v.parse().ok())
             .or_else(|| {
-                [4, 2, 1]
+                #[cfg(target_env = "ohos")]
+                let preferred = [1];
+                #[cfg(not(target_env = "ohos"))]
+                let preferred = [4, 2, 1];
+
+                preferred
                     .into_iter()
                     .find(|&n| (context.gpu.capabilities().sample_count_mask & n) != 0)
             })
