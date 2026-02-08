@@ -149,16 +149,15 @@ impl PlatformDispatcher for OhosDispatcher {
     }
 
     fn dispatch(&self, runnable: RunnableVariant, _label: Option<TaskLabel>, _priority: Priority) {
-        // On OHOS, we dispatch directly on the current thread
-        // In a real implementation, we might want to use OpenHarmonyApp's event loop
-        match runnable {
+        // On OHOS, run background tasks off the main thread to avoid UI stalls.
+        std::thread::spawn(move || match runnable {
             RunnableVariant::Meta(runnable) => {
                 runnable.run();
             }
             RunnableVariant::Compat(runnable) => {
                 runnable.run();
             }
-        }
+        });
     }
 
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, priority: Priority) {
