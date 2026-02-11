@@ -3,14 +3,12 @@ use crate::{
     GlyphId, LineLayout, Pixels, PlatformTextSystem, Point, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
     SUBPIXEL_VARIANTS_Y, ShapedGlyph, ShapedRun, SharedString, Size, point, size,
 };
-use anyhow::{Context as _, Ok, Result, bail};
+use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
 use cosmic_text::{
     Attrs, AttrsList, CacheKey, Family, Font as CosmicTextFont, FontFeatures as CosmicFontFeatures,
     FontSystem, ShapeBuffer, ShapeLine, SwashCache,
 };
-use log::warn;
-
 use itertools::Itertools;
 use parking_lot::RwLock;
 use pathfinder_geometry::{
@@ -26,11 +24,23 @@ pub(crate) struct OhosTextSystem(RwLock<OhosTextSystemState>);
 struct FontKey {
     family: SharedString,
     features: FontFeatures,
+    weight: FontWeight,
+    style: FontStyle,
 }
 
 impl FontKey {
-    fn new(family: SharedString, features: FontFeatures) -> Self {
-        Self { family, features }
+    fn new(
+        family: SharedString,
+        features: FontFeatures,
+        weight: FontWeight,
+        style: FontStyle,
+    ) -> Self {
+        Self {
+            family,
+            features,
+            weight,
+            style,
+        }
     }
 }
 
@@ -42,14 +52,24 @@ struct OhosTextSystemState {
     loaded_fonts: Vec<LoadedFont>,
     /// Caches the `FontId`s associated with a specific family to avoid iterating the font database
     /// for every font face in a family.
-    font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
+    font_ids_by_family_cache: HashMap<FontKey, CachedFamilyFonts>,
+    /// Monotonic version for font database mutations used to lazily invalidate cached family lookups.
+    font_db_generation: u64,
     system_fonts_loaded: bool,
+}
+
+#[derive(Clone)]
+struct CachedFamilyFonts {
+    generation: u64,
+    font_ids: SmallVec<[FontId; 4]>,
 }
 
 struct LoadedFont {
     font: Arc<CosmicTextFont>,
     features: CosmicFontFeatures,
     is_known_emoji_font: bool,
+    requested_weight: cosmic_text::Weight,
+    requested_style: cosmic_text::Style,
 }
 
 impl OhosTextSystem {
@@ -62,6 +82,7 @@ impl OhosTextSystem {
             scratch: ShapeBuffer::default(),
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
+            font_db_generation: 0,
             system_fonts_loaded: false,
         }))
     }
@@ -94,13 +115,29 @@ impl PlatformTextSystem for OhosTextSystem {
 
     fn font_id(&self, font: &Font) -> Result<FontId> {
         let mut state = self.0.write();
-        let key = FontKey::new(font.family.clone(), font.features.clone());
-        let candidates = if let Some(font_ids) = state.font_ids_by_family_cache.get(&key) {
-            font_ids.as_slice()
+        let key = FontKey::new(
+            font.family.clone(),
+            font.features.clone(),
+            font.weight,
+            font.style,
+        );
+        let generation = state.font_db_generation;
+        let candidates: SmallVec<[FontId; 4]> = if let Some(cached) =
+            state.font_ids_by_family_cache.get(&key)
+            && cached.generation == generation
+        {
+            cached.font_ids.clone()
         } else {
-            let font_ids = state.load_family(&font.family, &font.features)?;
-            state.font_ids_by_family_cache.insert(key.clone(), font_ids);
-            state.font_ids_by_family_cache[&key].as_ref()
+            let font_ids =
+                state.load_family(&font.family, &font.features, font.weight, font.style)?;
+            state.font_ids_by_family_cache.insert(
+                key.clone(),
+                CachedFamilyFonts {
+                    generation,
+                    font_ids: font_ids.clone(),
+                },
+            );
+            font_ids
         };
 
         let candidate_properties = candidates
@@ -115,7 +152,6 @@ impl PlatformTextSystem for OhosTextSystem {
         let ix =
             font_kit::matching::find_best_match(&candidate_properties, &font_into_properties(font))
                 .context("requested font family contains no font matching the other parameters")?;
-
         Ok(candidates[ix])
     }
 
@@ -213,11 +249,6 @@ impl OhosTextSystemState {
         }
 
         self.system_fonts_loaded = true;
-        if db.faces().next().is_none() {
-            warn!(
-                "OHOS text system: no system fonts found in common directories or fontdb defaults"
-            );
-        }
     }
 
     fn loaded_font(&self, font_id: FontId) -> &LoadedFont {
@@ -236,6 +267,8 @@ impl OhosTextSystemState {
                 }
             }
         }
+        // Mark cached family lookups stale. We keep cache entries and lazily refresh on demand.
+        self.font_db_generation = self.font_db_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -243,43 +276,24 @@ impl OhosTextSystemState {
         &mut self,
         name: &str,
         features: &FontFeatures,
+        requested_weight: FontWeight,
+        requested_style: FontStyle,
     ) -> Result<SmallVec<[FontId; 4]>> {
         self.ensure_system_fonts_loaded();
 
-        // Try a small list of known UI fonts on Harmony / Android and generic fallbacks.
-        let fallback_candidates = [
-            name,
-            "HarmonyOS Sans",
-            "HarmonyOS_Sans", // some OHOS builds expose family with underscore
-            "sans-serif",
-            "Roboto",
-            "Arial",
-            "Noto Sans",
-        ];
-
-        let mut families = SmallVec::<[_; 4]>::new();
-        for candidate in fallback_candidates {
-            let family_name = crate::text_system::font_name_with_fallbacks(candidate, candidate);
-            families = self
-                .font_system
-                .db()
-                .faces()
-                .filter(|face| face.families.iter().any(|family| *family_name == family.0))
-                .map(|face| (face.id, face.post_script_name.clone()))
-                .collect::<SmallVec<[_; 4]>>();
-            if !families.is_empty() {
-                break;
-            }
-        }
+        let family_name = crate::text_system::font_name_with_fallbacks(name, name);
+        let mut families = self
+            .font_system
+            .db()
+            .faces()
+            .filter(|face| face.families.iter().any(|family| *family_name == family.0))
+            .map(|face| (face.id, face.post_script_name.clone()))
+            .collect::<SmallVec<[_; 4]>>();
 
         // If still nothing found, pick the first available font as a last-resort fallback.
         if families.is_empty() {
             if let Some(first_face) = self.font_system.db().faces().next() {
                 families.push((first_face.id, first_face.post_script_name.clone()));
-                warn!(
-                    "OHOS text system: no matching family found for '{name}', using first available font '{}'",
-                    first_face.post_script_name
-                );
             } else {
                 anyhow::bail!("OHOS text system: no system fonts available");
             }
@@ -307,6 +321,8 @@ impl OhosTextSystemState {
                 font,
                 features: features.try_into()?,
                 is_known_emoji_font: check_is_known_emoji_font(&postscript_name),
+                requested_weight: requested_weight.into(),
+                requested_style: requested_style.into(),
             });
         }
 
@@ -387,6 +403,15 @@ impl OhosTextSystemState {
                 .clone()
                 .with_context(|| format!("no image for {params:?} in font {font:?}"))?;
 
+            let synthetic_bold = self.should_apply_synthetic_bold(params.font_id);
+            if synthetic_bold && !params.is_emoji {
+                embolden_bitmap(
+                    &mut image.data,
+                    image.placement.width as usize,
+                    image.placement.height as usize,
+                );
+            }
+
             if params.is_emoji {
                 // Convert from RGBA to BGRA.
                 for pixel in image.data.chunks_exact_mut(4) {
@@ -398,12 +423,17 @@ impl OhosTextSystemState {
         }
     }
 
-    fn font_id_for_cosmic_id(&mut self, id: cosmic_text::fontdb::ID) -> FontId {
-        if let Some(ix) = self
-            .loaded_fonts
-            .iter()
-            .position(|loaded_font| loaded_font.font.id() == id)
-        {
+    fn font_id_for_cosmic_id_with_request(
+        &mut self,
+        id: cosmic_text::fontdb::ID,
+        requested_weight: cosmic_text::Weight,
+        requested_style: cosmic_text::Style,
+    ) -> FontId {
+        if let Some(ix) = self.loaded_fonts.iter().position(|loaded_font| {
+            loaded_font.font.id() == id
+                && loaded_font.requested_weight == requested_weight
+                && loaded_font.requested_style == requested_style
+        }) {
             FontId(ix)
         } else {
             let font = self.font_system.get_font(id).unwrap();
@@ -414,10 +444,24 @@ impl OhosTextSystemState {
                 font,
                 features: CosmicFontFeatures::new(),
                 is_known_emoji_font: check_is_known_emoji_font(&face.post_script_name),
+                requested_weight,
+                requested_style,
             });
 
             font_id
         }
+    }
+
+    fn should_apply_synthetic_bold(&self, font_id: FontId) -> bool {
+        let loaded_font = self.loaded_font(font_id);
+        if loaded_font.requested_weight.0 < 600 {
+            return false;
+        }
+        let Some(face) = self.font_system.db().face(loaded_font.font.id()) else {
+            return false;
+        };
+        let needs_synthetic = face.weight.0 < loaded_font.requested_weight.0;
+        needs_synthetic
     }
 
     fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
@@ -433,8 +477,8 @@ impl OhosTextSystemState {
                     .metadata(run.font_id.0)
                     .family(Family::Name(&font.families.first().unwrap().0))
                     .stretch(font.stretch)
-                    .style(font.style)
-                    .weight(font.weight)
+                    .style(loaded_font.requested_style)
+                    .weight(loaded_font.requested_weight)
                     .font_features(loaded_font.features.clone()),
             );
             offs += run.len;
@@ -463,8 +507,14 @@ impl OhosTextSystemState {
         for glyph in &layout.glyphs {
             let mut font_id = FontId(glyph.metadata);
             let mut loaded_font = self.loaded_font(font_id);
+            let requested_weight = loaded_font.requested_weight;
+            let requested_style = loaded_font.requested_style;
             if loaded_font.font.id() != glyph.font_id {
-                font_id = self.font_id_for_cosmic_id(glyph.font_id);
+                font_id = self.font_id_for_cosmic_id_with_request(
+                    glyph.font_id,
+                    requested_weight,
+                    requested_style,
+                );
                 loaded_font = self.loaded_font(font_id);
             }
             let is_emoji = loaded_font.is_known_emoji_font;
@@ -623,4 +673,31 @@ fn face_info_into_properties(
 
 fn check_is_known_emoji_font(postscript_name: &str) -> bool {
     postscript_name == "NotoColorEmoji"
+}
+
+fn embolden_bitmap(data: &mut [u8], width: usize, height: usize) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let pixel_count = width.saturating_mul(height);
+    if pixel_count == 0 || data.is_empty() || data.len() % pixel_count != 0 {
+        return;
+    }
+    let channels = data.len() / pixel_count;
+    if channels == 0 {
+        return;
+    }
+
+    let original = data.to_vec();
+    for y in 0..height {
+        for x in 1..width {
+            let dst_base = (y * width + x) * channels;
+            let src_base = (y * width + (x - 1)) * channels;
+            for c in 0..channels {
+                let dst = dst_base + c;
+                let src = src_base + c;
+                data[dst] = data[dst].max(original[src]);
+            }
+        }
+    }
 }
