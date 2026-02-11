@@ -281,14 +281,32 @@ impl OhosTextSystemState {
     ) -> Result<SmallVec<[FontId; 4]>> {
         self.ensure_system_fonts_loaded();
 
-        let family_name = crate::text_system::font_name_with_fallbacks(name, name);
-        let mut families = self
-            .font_system
-            .db()
-            .faces()
-            .filter(|face| face.families.iter().any(|family| *family_name == family.0))
-            .map(|face| (face.id, face.post_script_name.clone()))
-            .collect::<SmallVec<[_; 4]>>();
+        let mut families = SmallVec::<[(cosmic_text::fontdb::ID, String); 4]>::new();
+        let mut seen_ids = HashMap::<cosmic_text::fontdb::ID, ()>::default();
+        let system_name = "HarmonyOS Sans";
+        let primary_name = crate::text_system::font_name_with_fallbacks(name, system_name);
+        let mut candidates = SmallVec::<[&str; 3]>::new();
+        candidates.push(primary_name);
+        if name == ".SystemUIFont" {
+            candidates.push("HarmonyOS_Sans");
+            candidates.push("sans-serif");
+        }
+
+        for candidate in candidates {
+            for face in self
+                .font_system
+                .db()
+                .faces()
+                .filter(|face| face.families.iter().any(|family| candidate == family.0))
+            {
+                if seen_ids.insert(face.id, ()).is_none() {
+                    families.push((face.id, face.post_script_name.clone()));
+                }
+            }
+            if !families.is_empty() {
+                break;
+            }
+        }
 
         // If still nothing found, pick the first available font as a last-resort fallback.
         if families.is_empty() {
