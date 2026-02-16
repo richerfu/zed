@@ -11294,8 +11294,9 @@ dependencies = [
 [[package]]
 name = "openharmony-ability"
 version = "0.3.0"
-source = "git+https://github.com/harmony-contrib/openharmony-ability.git#a9f489709d8ae669f922d0829492cfb224770b6b"
+source = "git+https://github.com/harmony-contrib/openharmony-ability.git#daa0b42c2dbe524fa0cb9b6a89702655a076b802"
 dependencies = [
+ "futures-channel",
  "napi-derive-ohos",
  "napi-ohos",
  "ohos-arkui-binding",
@@ -11307,7 +11308,7 @@ dependencies = [
 [[package]]
 name = "openharmony-ability-derive"
 version = "0.3.0"
-source = "git+https://github.com/harmony-contrib/openharmony-ability.git#a9f489709d8ae669f922d0829492cfb224770b6b"
+source = "git+https://github.com/harmony-contrib/openharmony-ability.git#daa0b42c2dbe524fa0cb9b6a89702655a076b802"
 dependencies = [
  "proc-macro2",
  "quote",

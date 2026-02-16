@@ -401,6 +401,10 @@ impl OhosWindow {
                                 handler.replace_text_in_range(None, &data.text);
                                 handler.unmark_text();
                             }
+                            ImeEvent::EnterEvent(_action) => {
+                                handler.replace_text_in_range(None, "\n");
+                                handler.unmark_text();
+                            }
                             ImeEvent::BackspaceEvent(len) => {
                                 let len = (len).max(0) as usize;
                                 if len == 0 {
