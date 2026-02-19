@@ -41,8 +41,10 @@ pub(crate) struct OhosWindow {
     gpu_context: Arc<BladeContext>,
     foreground_executor: ForegroundExecutor,
     keyboard_visible: Rc<Cell<bool>>,
+    touch_start_position: RefCell<Option<Point<Pixels>>>,
     last_touch_position: RefCell<Option<Point<Pixels>>>,
     touch_active: Cell<bool>,
+    touch_scrolling: Cell<bool>,
 }
 
 pub(crate) struct OhosWindowHandle {
@@ -126,9 +128,18 @@ impl OhosWindow {
             gpu_context,
             foreground_executor,
             keyboard_visible: Rc::new(Cell::new(false)),
+            touch_start_position: RefCell::new(None),
             last_touch_position: RefCell::new(None),
             touch_active: Cell::new(false),
+            touch_scrolling: Cell::new(false),
         })
+    }
+
+    fn reset_touch_state(&self) {
+        self.touch_active.set(false);
+        self.touch_scrolling.set(false);
+        *self.touch_start_position.borrow_mut() = None;
+        *self.last_touch_position.borrow_mut() = None;
     }
 
     fn show_keyboard_if_needed(&self) {
@@ -443,29 +454,48 @@ impl OhosWindow {
                 let scale = *self.scale.borrow();
                 let position = point(px(touch_event.x / scale), px(touch_event.y / scale));
                 let modifiers = Modifiers::default();
-                let input = match touch_event.event_type {
+                const TOUCH_SLOP: f32 = 8.0;
+
+                match touch_event.event_type {
                     TouchEvent::Down => {
                         self.touch_active.set(true);
+                        self.touch_scrolling.set(false);
+                        *self.touch_start_position.borrow_mut() = Some(position);
                         *self.last_touch_position.borrow_mut() = Some(position);
                         self.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
                             position,
                             pressed_button: None,
                             modifiers,
                         }));
-                        PlatformInput::MouseDown(MouseDownEvent {
-                            button: MouseButton::Left,
-                            position,
-                            modifiers,
-                            click_count: 1,
-                            first_mouse: false,
-                        })
                     }
-                    TouchEvent::Up => PlatformInput::MouseUp(MouseUpEvent {
-                        button: MouseButton::Left,
-                        position,
-                        modifiers,
-                        click_count: 1,
-                    }),
+                    TouchEvent::Up => {
+                        if self.touch_active.get() {
+                            if self.touch_scrolling.get() {
+                                self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                    position,
+                                    delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
+                                    modifiers,
+                                    touch_phase: TouchPhase::Ended,
+                                }));
+                            } else {
+                                self.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
+                                    button: MouseButton::Left,
+                                    position,
+                                    modifiers,
+                                    click_count: 1,
+                                    first_mouse: false,
+                                }));
+                                self.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                                    button: MouseButton::Left,
+                                    position,
+                                    modifiers,
+                                    click_count: 1,
+                                }));
+                            }
+                        }
+
+                        self.reset_touch_state();
+                    }
                     TouchEvent::Move => {
                         let pressed = touch_event
                             .touch_points
@@ -474,45 +504,57 @@ impl OhosWindow {
 
                         if !self.touch_active.get() {
                             self.touch_active.set(true);
+                            self.touch_scrolling.set(false);
+                            *self.touch_start_position.borrow_mut() = Some(position);
                             *self.last_touch_position.borrow_mut() = Some(position);
                         }
 
-                        if self.touch_active.get() {
-                            if let Some(last) = *self.last_touch_position.borrow() {
-                                let delta = point(position.x - last.x, position.y - last.y);
+                        let start = self.touch_start_position.borrow().unwrap_or(position);
+                        let from_start = point(position.x - start.x, position.y - start.y);
+                        let from_start_sq =
+                            from_start.x.0 * from_start.x.0 + from_start.y.0 * from_start.y.0;
+                        let slop_sq = TOUCH_SLOP * TOUCH_SLOP;
+                        let mut phase = TouchPhase::Moved;
+                        if !self.touch_scrolling.get() && from_start_sq > slop_sq {
+                            self.touch_scrolling.set(true);
+                            phase = TouchPhase::Started;
+                        }
+
+                        if let Some(last) = *self.last_touch_position.borrow() {
+                            let delta = point(position.x - last.x, position.y - last.y);
+                            if self.touch_scrolling.get() {
                                 if delta.x.0 != 0.0 || delta.y.0 != 0.0 {
                                     self.dispatch_input(PlatformInput::ScrollWheel(
                                         ScrollWheelEvent {
                                             position,
                                             delta: ScrollDelta::Pixels(delta),
                                             modifiers,
-                                            touch_phase: TouchPhase::Moved,
+                                            touch_phase: phase,
                                         },
                                     ));
                                 }
+                            } else {
+                                self.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
+                                    position,
+                                    pressed_button: pressed.then_some(MouseButton::Left),
+                                    modifiers,
+                                }));
                             }
-                            *self.last_touch_position.borrow_mut() = Some(position);
                         }
-
-                        PlatformInput::MouseMove(MouseMoveEvent {
-                            position,
-                            pressed_button: pressed.then_some(MouseButton::Left),
-                            modifiers,
-                        })
+                        *self.last_touch_position.borrow_mut() = Some(position);
                     }
                     TouchEvent::Cancel | TouchEvent::Unknown => {
-                        self.touch_active.set(false);
-                        *self.last_touch_position.borrow_mut() = None;
-                        return;
+                        if self.touch_active.get() && self.touch_scrolling.get() {
+                            self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                position,
+                                delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
+                                modifiers,
+                                touch_phase: TouchPhase::Ended,
+                            }));
+                        }
+                        self.reset_touch_state();
                     }
-                };
-
-                if matches!(touch_event.event_type, TouchEvent::Up) {
-                    self.touch_active.set(false);
-                    *self.last_touch_position.borrow_mut() = None;
                 }
-
-                self.dispatch_input(input);
             }
             _ => {}
         }
