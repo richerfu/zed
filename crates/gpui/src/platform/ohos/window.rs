@@ -159,6 +159,20 @@ impl OhosWindow {
         }
     }
 
+    fn notify_keyboard_hidden_by_user_if_needed(&self) {
+        if self.keyboard_visible.replace(false) {
+            let mut callback = self
+                .callbacks
+                .borrow_mut()
+                .virtual_keyboard_hidden_by_user
+                .take();
+            if let Some(ref mut cb) = callback {
+                cb();
+            }
+            self.callbacks.borrow_mut().virtual_keyboard_hidden_by_user = callback;
+        }
+    }
+
     /// Initialize the renderer when native_window becomes available (after SurfaceCreate event).
     /// This method gets the raw_window_handle from OpenHarmonyApp's native_window.
     fn initialize_renderer(&self) -> Result<()> {
@@ -374,16 +388,7 @@ impl OhosWindow {
             }
             Event::KeyboardEvent(height) => {
                 if *height <= 0 {
-                    self.keyboard_visible.set(false);
-                    let mut callback = self
-                        .callbacks
-                        .borrow_mut()
-                        .virtual_keyboard_hidden_by_user
-                        .take();
-                    if let Some(ref mut cb) = callback {
-                        cb();
-                    }
-                    self.callbacks.borrow_mut().virtual_keyboard_hidden_by_user = callback;
+                    self.notify_keyboard_hidden_by_user_if_needed();
                 } else {
                     self.keyboard_visible.set(true);
                 }
@@ -395,10 +400,16 @@ impl OhosWindow {
     fn handle_input_event(&self, event: &InputEvent) {
         match event {
             InputEvent::ImeEvent(ime_event) => {
+                if matches!(
+                    ime_event,
+                    ImeEvent::ImeStatusEvent(openharmony_ability::ime::KeyboardStatus::Hide)
+                ) {
+                    self.notify_keyboard_hidden_by_user_if_needed();
+                }
+
                 let handler_ref = self.input_handler.clone();
                 let ime_event = ime_event.clone();
                 let executor = self.foreground_executor.clone();
-                let keyboard_visible = self.keyboard_visible.clone();
 
                 executor
                     .spawn(async move {
@@ -443,7 +454,6 @@ impl OhosWindow {
                                 if matches!(status, openharmony_ability::ime::KeyboardStatus::Hide)
                                 {
                                     handler.unmark_text();
-                                    keyboard_visible.set(false);
                                 }
                             }
                         }
