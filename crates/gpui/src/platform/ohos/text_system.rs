@@ -3,7 +3,7 @@ use crate::{
     GlyphId, LineLayout, Pixels, PlatformTextSystem, Point, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
     SUBPIXEL_VARIANTS_Y, ShapedGlyph, ShapedRun, SharedString, Size, point, size,
 };
-use anyhow::{Context as _, Ok, Result};
+use anyhow::{Context as _, Result};
 use collections::HashMap;
 use cosmic_text::{
     Attrs, AttrsList, CacheKey, Family, Font as CosmicTextFont, FontFeatures as CosmicFontFeatures,
@@ -149,9 +149,16 @@ impl PlatformTextSystem for OhosTextSystem {
             })
             .collect::<SmallVec<[_; 4]>>();
 
-        let ix =
-            font_kit::matching::find_best_match(&candidate_properties, &font_into_properties(font))
-                .context("requested font family contains no font matching the other parameters")?;
+        let ix = match font_kit::matching::find_best_match(
+            &candidate_properties,
+            &font_into_properties(font),
+        ) {
+            Ok(ix) => ix,
+            // If style/weight matching fails, still keep the requested family by
+            // falling back to its first loaded face instead of escalating to the
+            // global system fallback stack.
+            Err(_) => 0,
+        };
         Ok(candidates[ix])
     }
 
@@ -219,6 +226,16 @@ impl PlatformTextSystem for OhosTextSystem {
 }
 
 impl OhosTextSystemState {
+    fn normalize_family_name(name: &str) -> String {
+        name.trim()
+            .to_lowercase()
+            .replace('_', " ")
+            .replace('-', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     fn ensure_system_fonts_loaded(&mut self) {
         if self.system_fonts_loaded {
             return;
@@ -281,7 +298,7 @@ impl OhosTextSystemState {
     ) -> Result<SmallVec<[FontId; 4]>> {
         self.ensure_system_fonts_loaded();
 
-        let mut families = SmallVec::<[(cosmic_text::fontdb::ID, String); 4]>::new();
+        let mut families = SmallVec::<[cosmic_text::fontdb::ID; 4]>::new();
         let mut seen_ids = HashMap::<cosmic_text::fontdb::ID, ()>::default();
         let system_name = "HarmonyOS Sans";
         let primary_name = crate::text_system::font_name_with_fallbacks(name, system_name);
@@ -293,14 +310,15 @@ impl OhosTextSystemState {
         }
 
         for candidate in candidates {
-            for face in self
-                .font_system
-                .db()
-                .faces()
-                .filter(|face| face.families.iter().any(|family| candidate == family.0))
-            {
+            let normalized_candidate = Self::normalize_family_name(candidate);
+            for face in self.font_system.db().faces().filter(|face| {
+                face.families.iter().any(|family| {
+                    candidate == family.0
+                        || normalized_candidate == Self::normalize_family_name(&family.0)
+                })
+            }) {
                 if seen_ids.insert(face.id, ()).is_none() {
-                    families.push((face.id, face.post_script_name.clone()));
+                    families.push(face.id);
                 }
             }
             if !families.is_empty() {
@@ -308,30 +326,45 @@ impl OhosTextSystemState {
             }
         }
 
-        // If still nothing found, pick the first available font as a last-resort fallback.
         if families.is_empty() {
-            if let Some(first_face) = self.font_system.db().faces().next() {
-                families.push((first_face.id, first_face.post_script_name.clone()));
-            } else {
-                anyhow::bail!("OHOS text system: no system fonts available");
+            log::warn!(
+                "OHOS text system: font family '{}' not found, falling back to '{}'",
+                name,
+                system_name
+            );
+
+            let normalized_system_name = Self::normalize_family_name(system_name);
+            for face in self.font_system.db().faces().filter(|face| {
+                face.families.iter().any(|family| {
+                    system_name == family.0
+                        || normalized_system_name == Self::normalize_family_name(&family.0)
+                })
+            }) {
+                if seen_ids.insert(face.id, ()).is_none() {
+                    families.push(face.id);
+                }
             }
         }
 
+        if families.is_empty() {
+            anyhow::bail!(
+                "OHOS text system: fallback font family '{}' is also unavailable",
+                system_name
+            );
+        }
+
         let mut loaded_font_ids = SmallVec::new();
-        for (font_id, postscript_name) in families {
+        for font_id in families {
+            let postscript_name = self
+                .font_system
+                .db()
+                .face(font_id)
+                .map(|face| face.post_script_name.clone())
+                .unwrap_or_default();
             let font = self
                 .font_system
                 .get_font(font_id)
                 .context("Could not load font")?;
-
-            let allowed_bad_font_names = ["SegoeFluentIcons", "Segoe Fluent Icons"];
-
-            if font.as_swash().charmap().map('m') == 0
-                && !allowed_bad_font_names.contains(&postscript_name.as_str())
-            {
-                self.font_system.db_mut().remove_face(font.id());
-                continue;
-            };
 
             let font_id = FontId(self.loaded_fonts.len());
             loaded_font_ids.push(font_id);
