@@ -6,7 +6,7 @@ use crate::{
 use anyhow::Result;
 use collections::HashMap;
 use editor::{
-    Editor, EditorEvent, EditorSettings, ExcerptRange, MultiBuffer, PathKey,
+    Editor, EditorEvent, ExcerptRange, MultiBuffer, PathKey,
     display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId},
     multibuffer_context_lines,
 };
@@ -29,8 +29,8 @@ use std::{
 use text::{Anchor, BufferSnapshot, OffsetRangeExt};
 use ui::{Button, ButtonStyle, Icon, IconName, Label, Tooltip, h_flex, prelude::*};
 use workspace::{
-    ItemHandle, ItemNavHistory, ToolbarItemLocation, Workspace,
-    item::{BreadcrumbText, Item, ItemEvent, TabContentParams},
+    ItemHandle, ItemNavHistory, Workspace,
+    item::{Item, ItemEvent, TabContentParams},
 };
 
 actions!(
@@ -701,18 +701,6 @@ impl Item for BufferDiagnosticsEditor {
         });
     }
 
-    fn breadcrumb_location(&self, cx: &App) -> ToolbarItemLocation {
-        if EditorSettings::get_global(cx).toolbar.breadcrumbs {
-            ToolbarItemLocation::PrimaryLeft
-        } else {
-            ToolbarItemLocation::Hidden
-        }
-    }
-
-    fn breadcrumbs(&self, theme: &theme::Theme, cx: &App) -> Option<Vec<BreadcrumbText>> {
-        self.editor.breadcrumbs(theme, cx)
-    }
-
     fn can_save(&self, _cx: &App) -> bool {
         true
     }
@@ -769,7 +757,7 @@ impl Item for BufferDiagnosticsEditor {
 
     fn navigate(
         &mut self,
-        data: Box<dyn Any>,
+        data: Arc<dyn Any + Send>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -878,7 +866,7 @@ impl Item for BufferDiagnosticsEditor {
         Some("Buffer Diagnostics Opened")
     }
 
-    fn to_item_events(event: &EditorEvent, f: impl FnMut(ItemEvent)) {
+    fn to_item_events(event: &EditorEvent, f: &mut dyn FnMut(ItemEvent)) {
         Editor::to_item_events(event, f)
     }
 }
@@ -916,7 +904,7 @@ impl Render for BufferDiagnosticsEditor {
                                 .style(ButtonStyle::Transparent)
                                 .tooltip(Tooltip::text("Open File"))
                                 .on_click(cx.listener(|buffer_diagnostics, _, window, cx| {
-                                    if let Some(workspace) = window.root::<Workspace>().flatten() {
+                                    if let Some(workspace) = Workspace::for_window(window, cx) {
                                         workspace.update(cx, |workspace, cx| {
                                             workspace
                                                 .open_path(
