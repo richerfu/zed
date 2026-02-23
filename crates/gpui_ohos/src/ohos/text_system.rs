@@ -53,6 +53,7 @@ struct OhosTextSystemState {
 
 struct LoadedFont {
     font: Arc<CosmicTextFont>,
+    font_weight: cosmic_text::Weight,
     features: CosmicFontFeatures,
     is_known_emoji_font: bool,
 }
@@ -348,15 +349,22 @@ impl OhosTextSystemState {
 
         let mut loaded_font_ids = SmallVec::new();
         for (font_id, postscript_name) in families {
+            let font_weight = self
+                .font_system
+                .db()
+                .face(font_id)
+                .map(|face| face.weight)
+                .unwrap_or(cosmic_text::Weight::NORMAL);
             let font = self
                 .font_system
-                .get_font(font_id)
+                .get_font(font_id, font_weight)
                 .context("could not load font")?;
 
             let font_id = FontId(self.loaded_fonts.len());
             loaded_font_ids.push(font_id);
             self.loaded_fonts.push(LoadedFont {
                 font,
+                font_weight,
                 features: cosmic_font_features_from(features)?,
                 is_known_emoji_font: check_is_known_emoji_font(&postscript_name),
             });
@@ -383,7 +391,8 @@ impl OhosTextSystemState {
     }
 
     fn raster_bounds(&mut self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
-        let font = &self.loaded_fonts[params.font_id.0].font;
+        let loaded_font = &self.loaded_fonts[params.font_id.0];
+        let font = &loaded_font.font;
         let subpixel_shift = point(
             params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32 / params.scale_factor,
             params.subpixel_variant.y as f32 / SUBPIXEL_VARIANTS_Y as f32 / params.scale_factor,
@@ -397,6 +406,7 @@ impl OhosTextSystemState {
                     params.glyph_id.0 as u16,
                     (params.font_size * params.scale_factor).into(),
                     (subpixel_shift.x, subpixel_shift.y.trunc()),
+                    loaded_font.font_weight,
                     cosmic_text::CacheKeyFlags::empty(),
                 )
                 .0,
@@ -419,7 +429,8 @@ impl OhosTextSystemState {
         }
 
         let bitmap_size = glyph_bounds.size;
-        let font = &self.loaded_fonts[params.font_id.0].font;
+        let loaded_font = &self.loaded_fonts[params.font_id.0];
+        let font = &loaded_font.font;
         let subpixel_shift = point(
             params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32 / params.scale_factor,
             params.subpixel_variant.y as f32 / SUBPIXEL_VARIANTS_Y as f32 / params.scale_factor,
@@ -433,6 +444,7 @@ impl OhosTextSystemState {
                     params.glyph_id.0 as u16,
                     (params.font_size * params.scale_factor).into(),
                     (subpixel_shift.x, subpixel_shift.y.trunc()),
+                    loaded_font.font_weight,
                     cosmic_text::CacheKeyFlags::empty(),
                 )
                 .0,
@@ -459,7 +471,14 @@ impl OhosTextSystemState {
         } else {
             let font = self
                 .font_system
-                .get_font(id)
+                .get_font(
+                    id,
+                    self.font_system
+                        .db()
+                        .face(id)
+                        .map(|face| face.weight)
+                        .unwrap_or(cosmic_text::Weight::NORMAL),
+                )
                 .expect("font id should be valid");
             let face = self
                 .font_system
@@ -470,6 +489,7 @@ impl OhosTextSystemState {
             let font_id = FontId(self.loaded_fonts.len());
             self.loaded_fonts.push(LoadedFont {
                 font,
+                font_weight: face.weight,
                 features: CosmicFontFeatures::new(),
                 is_known_emoji_font: check_is_known_emoji_font(&face.post_script_name),
             });
@@ -520,6 +540,7 @@ impl OhosTextSystemState {
             None,
             &mut layout_lines,
             None,
+            cosmic_text::Hinting::Disabled,
         );
         let layout = layout_lines
             .first()
