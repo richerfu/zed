@@ -1,5 +1,3 @@
-use log::warn;
-
 use std::{
     cmp::Ordering,
     collections::BinaryHeap,
@@ -9,8 +7,7 @@ use std::{
 };
 
 use crate::{
-    PlatformDispatcher, Priority, PriorityQueueSender, RealtimePriority, RunnableVariant,
-    TaskLabel, TaskTiming, ThreadTaskTimings,
+    PlatformDispatcher, Priority, PriorityQueueSender, RunnableVariant, ThreadTaskTimings,
 };
 use openharmony_ability::OpenHarmonyWaker;
 
@@ -112,26 +109,12 @@ impl OhosDispatcher {
         }
 
         for runnable in due {
-            match runnable {
-                RunnableVariant::Meta(runnable) => {
-                    runnable.run();
-                }
-                RunnableVariant::Compat(runnable) => {
-                    runnable.run();
-                }
-            }
+            runnable.run();
         }
     }
 
     pub(crate) fn execute_runnable(runnable: RunnableVariant) {
-        match runnable {
-            RunnableVariant::Meta(runnable) => {
-                runnable.run();
-            }
-            RunnableVariant::Compat(runnable) => {
-                runnable.run();
-            }
-        }
+        runnable.run();
     }
 }
 
@@ -140,24 +123,22 @@ impl PlatformDispatcher for OhosDispatcher {
         Vec::new()
     }
 
-    fn get_current_thread_timings(&self) -> Vec<TaskTiming> {
-        Vec::new()
+    fn get_current_thread_timings(&self) -> ThreadTaskTimings {
+        ThreadTaskTimings {
+            thread_name: None,
+            thread_id: thread::current().id(),
+            timings: Vec::new(),
+            total_pushed: 0,
+        }
     }
 
     fn is_main_thread(&self) -> bool {
         thread::current().id() == self.main_thread_id
     }
 
-    fn dispatch(&self, runnable: RunnableVariant, _label: Option<TaskLabel>, _priority: Priority) {
+    fn dispatch(&self, runnable: RunnableVariant, _priority: Priority) {
         // On OHOS, run background tasks off the main thread to avoid UI stalls.
-        std::thread::spawn(move || match runnable {
-            RunnableVariant::Meta(runnable) => {
-                runnable.run();
-            }
-            RunnableVariant::Compat(runnable) => {
-                runnable.run();
-            }
-        });
+        std::thread::spawn(move || runnable.run());
     }
 
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, priority: Priority) {
@@ -189,7 +170,7 @@ impl PlatformDispatcher for OhosDispatcher {
         cvar.notify_one();
     }
 
-    fn spawn_realtime(&self, _priority: RealtimePriority, f: Box<dyn FnOnce() + Send>) {
+    fn spawn_realtime(&self, f: Box<dyn FnOnce() + Send>) {
         thread::spawn(f);
     }
 

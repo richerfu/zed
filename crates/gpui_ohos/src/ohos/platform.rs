@@ -12,18 +12,17 @@ use futures::channel::oneshot;
 use openharmony_ability::{Event, OpenHarmonyApp};
 
 use crate::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId,
-    ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, PriorityQueueReceiver, Result as GpuiResult, RunnableVariant, Task,
+    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
+    Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform, PlatformDisplay,
+    PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow,
+    PriorityQueueReceiver, Result as GpuiResult, RunnableVariant, Task, ThermalState,
     WindowAppearance, WindowParams,
 };
 
 use super::{
     dispatcher::OhosDispatcher, display::OhosDisplay, text_system::OhosTextSystem,
-    window::OhosWindow,
+    wgpu_context::WgpuContext, window::OhosWindow,
 };
-use crate::platform::blade::BladeContext;
 
 pub(crate) struct OhosPlatform {
     app: Rc<RefCell<Option<OpenHarmonyApp>>>,
@@ -33,7 +32,7 @@ pub(crate) struct OhosPlatform {
     text_system: Arc<dyn PlatformTextSystem>,
     primary_display: Rc<RefCell<Option<OhosDisplay>>>,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
-    gpu_context: Arc<BladeContext>,
+    gpu_context: Arc<WgpuContext>,
     windows: Rc<RefCell<Vec<Weak<RefCell<OhosWindow>>>>>,
 }
 
@@ -45,9 +44,9 @@ impl OhosPlatform {
         let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
         let text_system = Arc::new(OhosTextSystem::new());
 
-        // Initialize GPU context for Blade renderer, same as Linux Wayland
+        // Initialize GPU context for WGPU renderer.
         // Note: ZED_DEVICE_ID environment variable is optional - if not set, device_id defaults to 0
-        let gpu_context = Arc::new(BladeContext::new()
+        let gpu_context = Arc::new(WgpuContext::new()
             .map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to create GPU context: {}. \
@@ -252,13 +251,19 @@ impl Platform for OhosPlatform {
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         if self.app.borrow().is_some() {
-            let window = Rc::new(RefCell::new(OhosWindow::new(
+            let window = OhosWindow::new(
                 self.app.clone(),
                 handle,
                 options,
                 self.gpu_context.clone(),
                 self.foreground_executor.clone(),
-            )?));
+            )?;
+
+            // GPUI fetches sprite_atlas during window initialization and caches it.
+            // Renderer must be ready at open_window time to avoid caching a broken atlas.
+            window.initialize_renderer()?;
+
+            let window = Rc::new(RefCell::new(window));
             self.windows.borrow_mut().push(Rc::downgrade(&window));
             Ok(Box::new(super::window::OhosWindowHandle::new(window)))
         } else {
@@ -411,4 +416,16 @@ impl Platform for OhosPlatform {
     fn on_keyboard_layout_change(&self, _callback: Box<dyn FnMut()>) {
         // Not supported on OHOS
     }
+
+    fn thermal_state(&self) -> ThermalState {
+        ThermalState::Nominal
+    }
+
+    fn on_thermal_state_change(&self, _callback: Box<dyn FnMut()>) {}
+
+    fn read_from_primary(&self) -> Option<ClipboardItem> {
+        None
+    }
+
+    fn write_to_primary(&self, _item: ClipboardItem) {}
 }

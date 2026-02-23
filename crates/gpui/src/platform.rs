@@ -12,12 +12,6 @@ mod test;
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 mod visual_test;
 
-#[cfg(target_env = "ohos")]
-mod blade;
-
-#[cfg(target_env = "ohos")]
-mod ohos;
-
 #[cfg(all(
     feature = "screen-capture",
     any(target_os = "windows", target_os = "linux", target_os = "freebsd",)
@@ -82,17 +76,6 @@ pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream}
 
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub use visual_test::VisualTestPlatform;
-
-#[cfg(target_env = "ohos")]
-pub fn current_platform(_headless: bool) -> Rc<dyn Platform> {
-    Rc::new(
-        ohos::OhosPlatform::new()
-            .inspect_err(|err| {
-                log::error!("Failed to initialize OHOS platform: {}", err);
-            })
-            .unwrap_or_else(|_| panic!("Failed to initialize OHOS platform")),
-    )
-}
 
 /// Return which compositor we're guessing we'll use.
 /// Does not attempt to connect to the given compositor.
@@ -499,6 +482,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>);
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>);
+    #[cfg(target_env = "ohos")]
+    fn on_virtual_keyboard_hidden_by_user(&self, _callback: Box<dyn FnMut()>) {}
+    #[cfg(target_env = "ohos")]
+    fn set_virtual_keyboard_visible(&self, _visible: bool) {}
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>);
     fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>);
     fn on_moved(&self, callback: Box<dyn FnMut()>);

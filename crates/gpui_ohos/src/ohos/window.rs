@@ -7,38 +7,31 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use futures::channel::oneshot;
-use openharmony_ability::{
-    Event, ImeEvent, InputEvent, OpenHarmonyApp, Size as OhosSize, xcomponent::TouchEvent,
-};
+use openharmony_ability::{Event, ImeEvent, InputEvent, OpenHarmonyApp, xcomponent::TouchEvent};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use util::ResultExt;
-
-use std::borrow::Cow;
-
-use crate::platform::blade::{BladeContext, BladeRenderer, BladeSurfaceConfig};
-use crate::{
-    AnyWindowHandle, Bounds, Capslock, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, ResizeEdge, Scene, ScrollDelta, ScrollWheelEvent, Size,
-    TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowControls, WindowDecorations, WindowParams, point, px, size,
-};
-use blade_graphics as gpu;
 
 use super::display::OhosDisplay;
+use super::wgpu_context::WgpuContext;
+use super::wgpu_renderer::{WgpuRenderer, WgpuSurfaceConfig};
+use crate::{
+    Bounds, Capslock, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
+    RequestFrameOptions, ResizeEdge, Scene, ScrollDelta, ScrollWheelEvent, Size, TouchPhase,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
+    WindowDecorations, WindowParams, point, px, size,
+};
 
 pub(crate) struct OhosWindow {
     app: Rc<RefCell<Option<OpenHarmonyApp>>>,
-    handle: AnyWindowHandle,
     bounds: RefCell<Bounds<Pixels>>,
     scale: RefCell<f32>,
     input_handler: Rc<RefCell<Option<PlatformInputHandler>>>,
     callbacks: RefCell<WindowCallbacks>,
-    renderer: RefCell<Option<BladeRenderer>>,
-    gpu_context: Arc<BladeContext>,
+    renderer: RefCell<Option<WgpuRenderer>>,
+    gpu_context: Arc<WgpuContext>,
     foreground_executor: ForegroundExecutor,
     keyboard_visible: Rc<Cell<bool>>,
     touch_start_position: RefCell<Option<Point<Pixels>>>,
@@ -89,9 +82,9 @@ struct WindowCallbacks {
 impl OhosWindow {
     pub(crate) fn new(
         app: Rc<RefCell<Option<OpenHarmonyApp>>>,
-        handle: AnyWindowHandle,
+        _handle: crate::AnyWindowHandle,
         params: WindowParams,
-        gpu_context: Arc<BladeContext>,
+        gpu_context: Arc<WgpuContext>,
         foreground_executor: ForegroundExecutor,
     ) -> Result<Self> {
         let scale = app
@@ -107,7 +100,6 @@ impl OhosWindow {
 
         Ok(Self {
             app: app.clone(),
-            handle,
             bounds: RefCell::new(bounds),
             scale: RefCell::new(scale),
             input_handler: Rc::new(RefCell::new(None)),
@@ -175,7 +167,7 @@ impl OhosWindow {
 
     /// Initialize the renderer when native_window becomes available (after SurfaceCreate event).
     /// This method gets the raw_window_handle from OpenHarmonyApp's native_window.
-    fn initialize_renderer(&self) -> Result<()> {
+    pub(crate) fn initialize_renderer(&self) -> Result<()> {
         let mut renderer_guard = self.renderer.borrow_mut();
         if renderer_guard.is_some() {
             // Already initialized
@@ -207,12 +199,12 @@ impl OhosWindow {
             content_rect.width as u32
         } else {
             // Fallback to bounds if content_rect is not available yet
-            self.bounds.borrow().size.width.0 as u32
+            self.bounds.borrow().size.width.as_f32() as u32
         };
         let device_height = if content_rect.height > 0 {
             content_rect.height as u32
         } else {
-            self.bounds.borrow().size.height.0 as u32
+            self.bounds.borrow().size.height.as_f32() as u32
         };
 
         debug!(
@@ -233,11 +225,10 @@ impl OhosWindow {
             *self.bounds.borrow_mut() = Bounds::new(logical_origin, logical_size);
         }
 
-        let config = BladeSurfaceConfig {
-            size: gpu::Extent {
-                width: device_width,
-                height: device_height,
-                depth: 1,
+        let config = WgpuSurfaceConfig {
+            size: Size {
+                width: DevicePixels(device_width as i32),
+                height: DevicePixels(device_height as i32),
             },
             transparent: true,
         };
@@ -261,14 +252,14 @@ impl OhosWindow {
             }
         }
 
-        debug!("OhosWindow: Creating BladeRenderer...");
+        debug!("OhosWindow: Creating WgpuRenderer...");
 
         // Create renderer using the window's HasWindowHandle and HasDisplayHandle implementation
         // which will get the raw_window_handle from native_window
-        let renderer = BladeRenderer::new(&self.gpu_context, self, config)
+        let renderer = WgpuRenderer::new(&self.gpu_context, self, config)
             .map_err(|e| {
-                warn!("OhosWindow: BladeRenderer::new failed: {}", e);
-                anyhow::anyhow!("Failed to create Blade renderer: {}. Make sure native_window is available from OpenHarmonyApp.", e)
+                warn!("OhosWindow: WgpuRenderer::new failed: {}", e);
+                anyhow::anyhow!("Failed to create Wgpu renderer: {}. Make sure native_window is available from OpenHarmonyApp.", e)
             })?;
 
         *renderer_guard = Some(renderer);
@@ -521,8 +512,8 @@ impl OhosWindow {
 
                         let start = self.touch_start_position.borrow().unwrap_or(position);
                         let from_start = point(position.x - start.x, position.y - start.y);
-                        let from_start_sq =
-                            from_start.x.0 * from_start.x.0 + from_start.y.0 * from_start.y.0;
+                        let from_start_sq = from_start.x.as_f32() * from_start.x.as_f32()
+                            + from_start.y.as_f32() * from_start.y.as_f32();
                         let slop_sq = TOUCH_SLOP * TOUCH_SLOP;
                         let mut phase = TouchPhase::Moved;
                         if !self.touch_scrolling.get() && from_start_sq > slop_sq {
@@ -533,7 +524,7 @@ impl OhosWindow {
                         if let Some(last) = *self.last_touch_position.borrow() {
                             let delta = point(position.x - last.x, position.y - last.y);
                             if self.touch_scrolling.get() {
-                                if delta.x.0 != 0.0 || delta.y.0 != 0.0 {
+                                if delta.x.as_f32() != 0.0 || delta.y.as_f32() != 0.0 {
                                     self.dispatch_input(PlatformInput::ScrollWheel(
                                         ScrollWheelEvent {
                                             position,
@@ -613,7 +604,7 @@ impl HasDisplayHandle for OhosWindow {
     fn display_handle(
         &self,
     ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
-        Err(raw_window_handle::HandleError::Unavailable)
+        Ok(raw_window_handle::DisplayHandle::ohos())
     }
 }
 
@@ -621,7 +612,7 @@ impl HasDisplayHandle for OhosWindowHandle {
     fn display_handle(
         &self,
     ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
-        Err(raw_window_handle::HandleError::Unavailable)
+        Ok(raw_window_handle::DisplayHandle::ohos())
     }
 }
 
@@ -698,6 +689,10 @@ impl PlatformWindow for OhosWindowHandle {
 
     fn is_hovered(&self) -> bool {
         self.with_window(|window| window.is_hovered())
+    }
+
+    fn background_appearance(&self) -> WindowBackgroundAppearance {
+        self.with_window(|window| window.background_appearance())
     }
 
     fn set_title(&mut self, title: &str) {
@@ -802,6 +797,10 @@ impl PlatformWindow for OhosWindowHandle {
         self.with_window(|window| window.gpu_specs())
     }
 
+    fn is_subpixel_rendering_supported(&self) -> bool {
+        self.with_window(|window| window.is_subpixel_rendering_supported())
+    }
+
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         self.with_window(|window| window.update_ime_position(bounds))
     }
@@ -885,6 +884,10 @@ impl PlatformWindow for OhosWindow {
 
     fn is_hovered(&self) -> bool {
         false
+    }
+
+    fn background_appearance(&self) -> WindowBackgroundAppearance {
+        WindowBackgroundAppearance::Opaque
     }
 
     fn set_title(&mut self, _title: &str) {
@@ -973,11 +976,8 @@ impl PlatformWindow for OhosWindow {
             }
         }
 
-        // Use Blade renderer to render the scene (same as Linux/Wayland)
+        // Use WGPU renderer to render the scene.
         if let Some(ref mut renderer) = *self.renderer.borrow_mut() {
-            let batch_count = scene.batches().count();
-            let bounds = *self.bounds.borrow();
-            let scale = *self.scale.borrow();
             renderer.draw(scene);
         } else {
             warn!("OhosWindow: draw called but renderer is not available");
@@ -985,38 +985,18 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
-        // Use Blade renderer's atlas, same as Linux Wayland
         if let Some(ref renderer) = *self.renderer.borrow() {
             renderer.sprite_atlas().clone()
         } else {
-            // Try to initialize renderer lazily; if it still fails, return dummy atlas with error.
-            if self.renderer.borrow().is_none() {
-                if let Err(err) = self.initialize_renderer() {
-                    warn!(
-                        "OhosWindow: Failed to initialize renderer when fetching atlas: {}",
-                        err
-                    );
-                }
+            if let Err(error) = self.initialize_renderer() {
+                panic!("OhosWindow: renderer must be initialized before sprite_atlas: {error}");
             }
-            if let Some(ref renderer) = *self.renderer.borrow() {
-                return renderer.sprite_atlas().clone();
-            }
-
-            // Fallback to dummy atlas if renderer is not available
-            struct DummyAtlas;
-            impl PlatformAtlas for DummyAtlas {
-                fn get_or_insert_with<'a>(
-                    &self,
-                    _key: &crate::AtlasKey,
-                    _build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
-                ) -> Result<Option<crate::AtlasTile>> {
-                    Err(anyhow!(
-                        "renderer not initialized; sprite atlas unavailable"
-                    ))
-                }
-                fn remove(&self, _key: &crate::AtlasKey) {}
-            }
-            Arc::new(DummyAtlas)
+            self.renderer
+                .borrow()
+                .as_ref()
+                .expect("renderer should be initialized after initialize_renderer")
+                .sprite_atlas()
+                .clone()
         }
     }
 
@@ -1062,11 +1042,15 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
-        // Return GPU specs from the Blade renderer
+        // Return GPU specs from the WGPU renderer.
         self.renderer
             .borrow()
             .as_ref()
             .map(|renderer| renderer.gpu_specs())
+    }
+
+    fn is_subpixel_rendering_supported(&self) -> bool {
+        false
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {

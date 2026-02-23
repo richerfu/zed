@@ -35,7 +35,7 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
 
     #[cfg(target_env = "ohos")]
     {
-        gpui::current_platform(headless)
+        gpui_ohos::current_platform(headless)
     }
 
     #[cfg(all(

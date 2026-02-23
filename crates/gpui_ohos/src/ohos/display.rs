@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use openharmony_ability::OpenHarmonyApp;
 
-use crate::{Bounds, DisplayId, Pixels, PlatformDisplay, Result, Size, point, px, size};
+use crate::{Bounds, DisplayId, Pixels, PlatformDisplay, Result, point, px, size};
 
 #[derive(Clone)]
 pub(crate) struct OhosDisplay {
@@ -15,7 +15,7 @@ impl OhosDisplay {
     pub(crate) fn new(app: OpenHarmonyApp) -> Self {
         Self {
             app,
-            id: DisplayId(0),
+            id: DisplayId::new(0),
         }
     }
 }
