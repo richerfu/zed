@@ -9,7 +9,9 @@ use std::{
 
 use anyhow::Result;
 use futures::channel::oneshot;
-use openharmony_ability::{Event, ImeEvent, InputEvent, OpenHarmonyApp, xcomponent::TouchEvent};
+use openharmony_ability::{
+    AvoidAreaType, Event, ImeEvent, InputEvent, OpenHarmonyApp, xcomponent::TouchEvent,
+};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use super::display::OhosDisplay;
@@ -28,6 +30,7 @@ pub(crate) struct OhosWindow {
     app: Rc<RefCell<Option<OpenHarmonyApp>>>,
     bounds: RefCell<Bounds<Pixels>>,
     scale: RefCell<f32>,
+    keyboard_overlap_device_px: Cell<i32>,
     input_handler: Rc<RefCell<Option<PlatformInputHandler>>>,
     callbacks: RefCell<WindowCallbacks>,
     renderer: RefCell<Option<WgpuRenderer>>,
@@ -102,6 +105,7 @@ impl OhosWindow {
             app: app.clone(),
             bounds: RefCell::new(bounds),
             scale: RefCell::new(scale),
+            keyboard_overlap_device_px: Cell::new(0),
             input_handler: Rc::new(RefCell::new(None)),
             callbacks: RefCell::new(WindowCallbacks {
                 request_frame: None,
@@ -163,6 +167,199 @@ impl OhosWindow {
             }
             self.callbacks.borrow_mut().virtual_keyboard_hidden_by_user = callback;
         }
+    }
+
+    fn keyboard_inset_for_overlap(&self, overlap_device_px: i32) -> Pixels {
+        const MIN_CONTENT_HEIGHT: f32 = 64.0;
+
+        let overlap = overlap_device_px.max(0) as f32;
+        let scale = self.scale_factor().max(1.0);
+        let mut inset = (overlap / scale).max(0.0);
+        let bounds_height = self.bounds.borrow().size.height.as_f32().max(0.0);
+        let max_inset = (bounds_height - MIN_CONTENT_HEIGHT).max(0.0);
+        if inset > max_inset {
+            inset = max_inset;
+        }
+        px(inset)
+    }
+
+    fn keyboard_overlap_from_avoid_area_device_px(&self) -> Option<i32> {
+        let app_ref = self.app.borrow();
+        let app = app_ref.as_ref()?;
+
+        let content_rect = app.content_rect();
+        if content_rect.height <= 0 {
+            return Some(0);
+        }
+
+        // Use actual XComponent rect as layout basis for keyboard-avoid computation.
+        // This keeps behavior correct for embedded/non-fullscreen XComponents.
+        let layout_top = content_rect.top;
+        let layout_height = content_rect.height.max(0);
+        if layout_height <= 0 {
+            return Some(0);
+        }
+        let window_rect = app.window_rect();
+        let window_top = window_rect.top;
+        let window_bottom = window_rect.top.saturating_add(window_rect.height.max(0));
+
+        let keyboard_area = app.avoid_area(AvoidAreaType::Keyboard);
+        let system_area = app.avoid_area(AvoidAreaType::System);
+        let system_gesture_area = app.avoid_area(AvoidAreaType::SystemGesture);
+        let navigation_indicator_area = app.avoid_area(AvoidAreaType::NavigationIndicator);
+
+        // OHOS avoid-area bottomRect coordinates are in window/screen space.
+        // XComponent's content_rect can be reported in safe-content coordinates on some devices.
+        // For root full-width layouts, infer top-safe offset so intersection uses a consistent space.
+        let root_layout_width_matches_window = content_rect.width > 0
+            && window_rect.width > 0
+            && (content_rect.width - window_rect.width).abs() <= 1;
+        let can_infer_root_safe_top = layout_top == 0
+            && layout_height > 0
+            && window_rect.height >= layout_height
+            && root_layout_width_matches_window;
+        let inferred_outside_bottom_safe = if can_infer_root_safe_top {
+            let bottom_safe_overlap = |area: Option<openharmony_ability::AvoidArea>| -> i32 {
+                let Some(area) = area else {
+                    return 0;
+                };
+                if !area.visible || area.bottom_rect.height <= 0 {
+                    return 0;
+                }
+                let start = area.bottom_rect.top;
+                let end = area
+                    .bottom_rect
+                    .top
+                    .saturating_add(area.bottom_rect.height.max(0));
+                if end < window_bottom {
+                    return 0;
+                }
+                (window_bottom - start)
+                    .max(0)
+                    .min(area.bottom_rect.height.max(0))
+            };
+
+            bottom_safe_overlap(system_area)
+                .max(bottom_safe_overlap(system_gesture_area))
+                .max(bottom_safe_overlap(navigation_indicator_area))
+        } else {
+            0
+        };
+        let inferred_top_safe = if can_infer_root_safe_top {
+            (window_rect.height.max(0) - layout_height - inferred_outside_bottom_safe).max(0)
+        } else {
+            0
+        };
+        // Convert GPUI layout bounds to screen space before intersection.
+        let layout_top_screen = window_top
+            .saturating_add(inferred_top_safe)
+            .saturating_add(layout_top);
+        let layout_bottom_screen = layout_top_screen.saturating_add(layout_height);
+
+        let keyboard_avoid_visible = keyboard_area.map(|a| a.visible).unwrap_or(false);
+        if !(self.keyboard_visible.get() || keyboard_avoid_visible) {
+            return Some(0);
+        }
+
+        // Keyboard event only determines show/hide state.
+        // Actual inset is derived from avoid-area geometry.
+        // When keyboard is shown, include bottom occlusion union of:
+        // - Keyboard area
+        // - System bottom area (3-button navigation etc.)
+        // - System gesture area
+        // - Navigation indicator area
+        // This prevents under-subtraction where keyboard area excludes nav area.
+        let mut intervals: Vec<(i32, i32)> = Vec::with_capacity(4);
+        let mut push_bottom_overlap_interval =
+            |area: openharmony_ability::AvoidArea, require_visible: bool| {
+                if area.bottom_rect.height <= 0 {
+                    return;
+                }
+                if require_visible && !area.visible {
+                    return;
+                }
+                let start = area.bottom_rect.top.max(layout_top_screen);
+                let end = area
+                    .bottom_rect
+                    .top
+                    .saturating_add(area.bottom_rect.height.max(0))
+                    .min(layout_bottom_screen);
+                if end > start {
+                    intervals.push((start, end));
+                }
+            };
+
+        if let Some(area) = keyboard_area {
+            push_bottom_overlap_interval(area, true);
+        }
+        if let Some(area) = system_area {
+            push_bottom_overlap_interval(area, false);
+        }
+        if let Some(area) = system_gesture_area {
+            push_bottom_overlap_interval(area, false);
+        }
+        if let Some(area) = navigation_indicator_area {
+            push_bottom_overlap_interval(area, false);
+        }
+
+        if intervals.is_empty() {
+            return Some(0);
+        }
+
+        intervals.sort_unstable_by_key(|(start, _)| *start);
+        let mut union_overlap = 0i32;
+        let mut current = intervals[0];
+        for &(start, end) in intervals.iter().skip(1) {
+            if start <= current.1 {
+                current.1 = current.1.max(end);
+            } else {
+                union_overlap = union_overlap.saturating_add(current.1 - current.0);
+                current = (start, end);
+            }
+        }
+        union_overlap = union_overlap.saturating_add(current.1 - current.0);
+
+        let geometric_overlap = union_overlap.min(layout_height.max(0));
+        let clamped_overlap = geometric_overlap;
+
+        Some(clamped_overlap)
+    }
+
+    fn refresh_keyboard_overlap_device_px(&self) -> bool {
+        let previous_overlap = self.keyboard_overlap_device_px.get();
+        let next_overlap = self
+            .keyboard_overlap_from_avoid_area_device_px()
+            .unwrap_or(0)
+            .max(0);
+        if previous_overlap != next_overlap {
+            self.keyboard_overlap_device_px.set(next_overlap);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn effective_content_size(&self) -> Size<Pixels> {
+        let bounds_size = self.bounds.borrow().size;
+        let bounds_height = bounds_size.height.as_f32().max(0.0);
+        let keyboard_inset = self
+            .keyboard_inset_for_overlap(self.keyboard_overlap_device_px.get())
+            .as_f32();
+        size(
+            bounds_size.width,
+            px((bounds_height - keyboard_inset).max(0.0)),
+        )
+    }
+
+    fn emit_resize_callback(&self) {
+        let scale = *self.scale.borrow();
+        let content_size = self.effective_content_size();
+
+        let mut callback = self.callbacks.borrow_mut().resize.take();
+        if let Some(ref mut cb) = callback {
+            cb(content_size, scale);
+        }
+        self.callbacks.borrow_mut().resize = callback;
     }
 
     /// Initialize the renderer when native_window becomes available (after SurfaceCreate event).
@@ -269,7 +466,7 @@ impl OhosWindow {
 
     pub(crate) fn handle_event(&self, event: &Event) {
         match event {
-            Event::SurfaceCreate { .. } => {
+            Event::SurfaceCreate => {
                 debug!("OhosWindow: SurfaceCreate event received - initializing renderer");
                 // Initialize renderer when SurfaceCreate event is received
                 // Note: on_finish_launching is handled at the platform level (OhosPlatform::handle_ohos_event)
@@ -285,6 +482,9 @@ impl OhosWindow {
                         );
                     }
                 }
+                if self.refresh_keyboard_overlap_device_px() {
+                    self.emit_resize_callback();
+                }
             }
             Event::WindowResize(ohos_size) => {
                 let scale = *self.scale.borrow();
@@ -293,6 +493,7 @@ impl OhosWindow {
                 let new_size = size(px(width / scale), px(height / scale));
                 let origin = self.bounds.borrow().origin;
                 *self.bounds.borrow_mut() = Bounds::new(origin, new_size);
+                self.refresh_keyboard_overlap_device_px();
 
                 // Update renderer's drawable size
                 if let Some(ref mut renderer) = *self.renderer.borrow_mut() {
@@ -302,16 +503,26 @@ impl OhosWindow {
                     };
                     renderer.update_drawable_size(device_size);
                 }
-
-                // Take the callback out to avoid holding borrow during execution
-                let mut callback = self.callbacks.borrow_mut().resize.take();
-                if let Some(ref mut cb) = callback {
-                    cb(new_size, scale);
-                }
-                // Put it back
-                self.callbacks.borrow_mut().resize = callback;
+                self.emit_resize_callback();
             }
-            Event::WindowRedraw { .. } => {
+            Event::ContentRectChange(..) => {
+                if self.refresh_keyboard_overlap_device_px() {
+                    self.emit_resize_callback();
+                }
+            }
+            Event::AvoidAreaChange(info) => {
+                if matches!(
+                    info.area_type,
+                    AvoidAreaType::Keyboard
+                        | AvoidAreaType::System
+                        | AvoidAreaType::SystemGesture
+                        | AvoidAreaType::NavigationIndicator
+                ) && self.refresh_keyboard_overlap_device_px()
+                {
+                    self.emit_resize_callback();
+                }
+            }
+            Event::WindowRedraw(..) => {
                 // Take the callback out to avoid holding borrow during execution
                 // This is critical because the callback will eventually call window.draw()
                 // which may access other parts of OhosWindow
@@ -344,6 +555,9 @@ impl OhosWindow {
                 }
                 self.callbacks.borrow_mut().active_status_change = callback;
                 self.hide_keyboard_if_needed();
+                if self.refresh_keyboard_overlap_device_px() {
+                    self.emit_resize_callback();
+                }
             }
             Event::ConfigChanged(..) => {
                 let new_scale = self
@@ -353,14 +567,13 @@ impl OhosWindow {
                     .map(|a| a.scale() as f32)
                     .unwrap_or(1.0);
                 *self.scale.borrow_mut() = new_scale;
-                let bounds_size = self.bounds.borrow().size;
-                let mut callback = self.callbacks.borrow_mut().resize.take();
-                if let Some(ref mut cb) = callback {
-                    cb(bounds_size, new_scale);
-                }
-                self.callbacks.borrow_mut().resize = callback;
+                self.refresh_keyboard_overlap_device_px();
+                self.emit_resize_callback();
             }
             Event::WindowDestroy => {
+                if self.refresh_keyboard_overlap_device_px() {
+                    self.emit_resize_callback();
+                }
                 // For should_close, we need to call it and check return value
                 let mut should_close_callback = self.callbacks.borrow_mut().should_close.take();
                 let should_close = if let Some(ref mut cb) = should_close_callback {
@@ -383,6 +596,9 @@ impl OhosWindow {
                 } else {
                     self.keyboard_visible.set(true);
                 }
+                if self.refresh_keyboard_overlap_device_px() {
+                    self.emit_resize_callback();
+                }
             }
             _ => {}
         }
@@ -396,6 +612,9 @@ impl OhosWindow {
                     ImeEvent::ImeStatusEvent(openharmony_ability::ime::KeyboardStatus::Hide)
                 ) {
                     self.notify_keyboard_hidden_by_user_if_needed();
+                    if self.refresh_keyboard_overlap_device_px() {
+                        self.emit_resize_callback();
+                    }
                 }
 
                 let handler_ref = self.input_handler.clone();
@@ -820,7 +1039,7 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn content_size(&self) -> Size<Pixels> {
-        self.bounds.borrow().size
+        self.effective_content_size()
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
@@ -1038,7 +1257,8 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn set_client_inset(&self, _inset: Pixels) {
-        // Not supported on OHOS
+        // Keyboard avoidance is driven by content_size updates from avoid-area overlap.
+        // client_inset is intentionally ignored on OHOS.
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
