@@ -38,10 +38,19 @@ impl WgpuContext {
         };
 
         log::info!("OHOS WGPU backends configured: {:?}", backends);
+        let mut instance_flags = wgpu::InstanceFlags::from_env_or_default();
+        #[cfg(target_env = "ohos")]
+        {
+            let validation_override_present = std::env::var_os("WGPU_VALIDATION").is_some();
+            let debug_override_present = std::env::var_os("WGPU_DEBUG").is_some();
+            if !validation_override_present && !debug_override_present {
+                instance_flags.remove(wgpu::InstanceFlags::VALIDATION | wgpu::InstanceFlags::DEBUG);
+            }
+        }
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
-            flags: wgpu::InstanceFlags::default(),
+            flags: instance_flags,
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
         });

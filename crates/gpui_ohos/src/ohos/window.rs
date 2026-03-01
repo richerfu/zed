@@ -31,6 +31,7 @@ pub(crate) struct OhosWindow {
     bounds: RefCell<Bounds<Pixels>>,
     scale: RefCell<f32>,
     keyboard_overlap_device_px: Cell<i32>,
+    safe_area_avoidance_enabled: Cell<bool>,
     input_handler: Rc<RefCell<Option<PlatformInputHandler>>>,
     callbacks: RefCell<WindowCallbacks>,
     renderer: RefCell<Option<WgpuRenderer>>,
@@ -106,6 +107,7 @@ impl OhosWindow {
             bounds: RefCell::new(bounds),
             scale: RefCell::new(scale),
             keyboard_overlap_device_px: Cell::new(0),
+            safe_area_avoidance_enabled: Cell::new(true),
             input_handler: Rc::new(RefCell::new(None)),
             callbacks: RefCell::new(WindowCallbacks {
                 request_frame: None,
@@ -184,6 +186,10 @@ impl OhosWindow {
     }
 
     fn keyboard_overlap_from_avoid_area_device_px(&self) -> Option<i32> {
+        if !self.safe_area_avoidance_enabled.get() {
+            return Some(0);
+        }
+
         let app_ref = self.app.borrow();
         let app = app_ref.as_ref()?;
 
@@ -323,6 +329,13 @@ impl OhosWindow {
         let clamped_overlap = geometric_overlap;
 
         Some(clamped_overlap)
+    }
+
+    fn set_safe_area_avoidance_enabled(&self, enabled: bool) {
+        let previous = self.safe_area_avoidance_enabled.replace(enabled);
+        if previous != enabled && self.refresh_keyboard_overlap_device_px() {
+            self.emit_resize_callback();
+        }
     }
 
     fn refresh_keyboard_overlap_device_px(&self) -> bool {
@@ -973,6 +986,10 @@ impl PlatformWindow for OhosWindowHandle {
         })
     }
 
+    fn set_safe_area_avoidance(&self, enabled: bool) {
+        self.with_window(|window| window.set_safe_area_avoidance_enabled(enabled))
+    }
+
     fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>) {
         self.with_window(|window| window.on_resize(callback))
     }
@@ -1259,6 +1276,10 @@ impl PlatformWindow for OhosWindow {
     fn set_client_inset(&self, _inset: Pixels) {
         // Keyboard avoidance is driven by content_size updates from avoid-area overlap.
         // client_inset is intentionally ignored on OHOS.
+    }
+
+    fn set_safe_area_avoidance(&self, enabled: bool) {
+        self.set_safe_area_avoidance_enabled(enabled);
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {

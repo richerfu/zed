@@ -2042,6 +2042,11 @@ impl Window {
         self.platform_window.set_client_inset(inset);
     }
 
+    /// Enables or disables platform safe-area avoidance for this window at runtime.
+    pub fn set_safe_area_avoidance(&self, enabled: bool) {
+        self.platform_window.set_safe_area_avoidance(enabled);
+    }
+
     /// Returns the client_inset value by [`Self::set_client_inset`].
     pub fn client_inset(&self) -> Option<Pixels> {
         self.client_inset
