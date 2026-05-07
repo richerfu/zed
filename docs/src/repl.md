@@ -39,21 +39,21 @@ Zed supports running code in multiple languages. To get started, you need to ins
 - [Julia](#julia)
 - [Scala (Almond)](#scala)
 
-Once installed, you can start using the REPL in the respective language files, or other places those languages are supported, such as Markdown. If you recently added the kernels, run the `repl: refresh kernelspecs` command to make them available in the editor.
+Once installed, you can start using the REPL in the respective language files, or other places those languages are supported, such as Markdown. If you recently added the kernels, run the {#action repl::RefreshKernelspecs} command to make them available in the editor.
 
 ## Using the REPL
 
-To start the REPL, open a file with the language you want to use and use the `repl: run` command (defaults to `ctrl-shift-enter` on macOS) to run a block, selection, or line. You can also click on the REPL icon in the toolbar.
+To start the REPL, open a file with the language you want to use and use the {#action repl::Run} command (defaults to `ctrl-shift-enter` on macOS) to run a block, selection, or line. You can also click on the REPL icon in the toolbar.
 
-The `repl: run` command will be executed on your selection(s), and the result will be displayed below the selection.
+The {#action repl::Run} command will be executed on your selection(s), and the result will be displayed below the selection.
 
-Outputs can be cleared with the `repl: clear outputs` command, or from the REPL menu in the toolbar.
+Outputs can be cleared with the {#action repl::ClearOutputs} command, or from the REPL menu in the toolbar.
 
 ### Cell mode
 
 Zed supports [notebooks as scripts](https://jupytext.readthedocs.io/en/latest/formats-scripts.html) using the `# %%` cell separator in Python and `// %%` in TypeScript. This allows you to write code in a single file and run it as if it were a notebook, cell by cell.
 
-The `repl: run` command will run each block of code between the `# %%` markers as a separate cell.
+The {#action repl::Run} command will run each block of code between the `# %%` markers as a separate cell.
 
 ```python
 # %% Cell 1
@@ -151,8 +151,6 @@ TBD: Improve Julia REPL instructions
 
 ## Changing which kernel is used per language {#changing-kernels}
 
-> **Preview:** This feature is available in Zed Preview. It will be included in the next Stable release.
-
 Zed automatically detects available kernels and organizes them in the kernel picker:
 
 - **Recommended**: The Python environment matching your active toolchain (if detected)
@@ -193,8 +191,6 @@ To configure a different default kernel for a language, you can assign a kernel 
 
 ## Interactive Input
 
-> **Preview:** This feature is available in Zed Preview. It will be included in the next Stable release.
-
 When code execution requires user input (such as Python's `input()` function), the REPL displays an input prompt below the cell output.
 
 Type your response in the text field and press `Enter` to submit. The kernel receives your input and continues execution.
@@ -205,7 +201,7 @@ If execution is interrupted while an input prompt is active, the prompt automati
 
 ## Debugging Kernelspecs
 
-Available kernels are shown via the `repl: sessions` command. To refresh the kernels you can run, use the `repl: refresh kernelspecs` command.
+Available kernels are shown via the {#action repl::Sessions} command. To refresh the kernels you can run, use the {#action repl::RefreshKernelspecs} command.
 
 If you have `jupyter` installed, you can run `jupyter kernelspec list` to see the available kernels.
 

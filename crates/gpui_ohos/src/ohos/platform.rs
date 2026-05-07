@@ -196,6 +196,14 @@ impl Platform for OhosPlatform {
         // Not supported on OHOS
     }
 
+    fn hide_cursor_until_mouse_moves(&self) {
+        // Not supported on OHOS
+    }
+
+    fn is_cursor_visible(&self) -> bool {
+        true
+    }
+
     fn hide(&self) {
         // Not supported on OHOS
     }

@@ -9,7 +9,7 @@ Use Zed's command-line interface (CLI) to open files and directories, integrate 
 
 ## Installation
 
-**macOS:** Run the `cli: install` command from the command palette ({#kb command_palette::Toggle}) to install the `zed` CLI to `/usr/local/bin/zed`.
+**macOS:** Run the {#action cli::InstallCliBinary} command from the command palette ({#kb command_palette::Toggle}) to install the `zed` CLI to `/usr/local/bin/zed`.
 
 **Linux:** The CLI is included with Zed packages. The binary name may vary by distribution (commonly `zed` or `zeditor`).
 
@@ -70,8 +70,6 @@ zed -n ~/projects/myproject
 ```
 
 ### `-a`, `--add`
-
-> **Changed in Preview (v0.225).** See [release notes](/releases#0.225).
 
 Add paths to the currently focused workspace instead of opening a new window. When multiple workspace windows are open, files open in the focused window:
 
