@@ -3,9 +3,10 @@ use log::{debug, warn};
 
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     rc::Rc,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -19,7 +20,7 @@ use super::display::OhosDisplay;
 use super::wgpu_context::WgpuContext;
 use super::wgpu_renderer::{WgpuRenderer, WgpuSurfaceConfig};
 use crate::{
-    Bounds, Capslock, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers, MouseButton,
+    Axis, Bounds, Capslock, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
     RequestFrameOptions, ResizeEdge, Scene, ScrollDelta, ScrollWheelEvent, Size, TouchPhase,
@@ -39,13 +40,16 @@ pub(crate) struct OhosWindow {
     gpu_context: Arc<WgpuContext>,
     foreground_executor: ForegroundExecutor,
     keyboard_visible: Rc<Cell<bool>>,
-    touch_start_position: RefCell<Option<Point<Pixels>>>,
-    last_touch_position: RefCell<Option<Point<Pixels>>>,
-    last_touch_timestamp: Cell<Option<Instant>>,
-    touch_velocity: Cell<Point<f32>>,
-    momentum_generation: Rc<Cell<u64>>,
-    touch_active: Cell<bool>,
-    touch_scrolling: Cell<bool>,
+    pending_touch_scroll: RefCell<Option<PendingTouchScroll>>,
+    last_dispatched_touch_position: RefCell<Option<Point<Pixels>>>,
+    touch_state: Cell<TouchState>,
+    touch_down_timestamp: Cell<Option<Duration>>,
+    last_touch_timestamp: Cell<Option<Duration>>,
+    touch_hit_boundary: Cell<bool>,
+    touch_velocity_tracker: RefCell<TouchVelocityTracker>,
+    scroll_animation: RefCell<Option<ScrollAnimation>>,
+    scroll_frame_rate_boosted: Cell<bool>,
+    pending_touch_click_feedback_cancel: Cell<Option<Modifiers>>,
 }
 
 pub(crate) struct OhosWindowHandle {
@@ -87,15 +91,273 @@ struct WindowCallbacks {
     hit_test_window_control: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
 }
 
+#[derive(Clone, Copy)]
+struct PendingTouchScroll {
+    position: Point<Pixels>,
+    modifiers: Modifiers,
+    phase: TouchPhase,
+}
+
+#[derive(Clone, Copy, Default)]
+enum TouchState {
+    #[default]
+    Idle,
+    Pending(TouchPendingState),
+    Scrolling(TouchScrollState),
+}
+
+#[derive(Clone, Copy)]
+struct TouchPendingState {
+    start_position: Point<Pixels>,
+    last_position: Point<Pixels>,
+    cancel_click: bool,
+    mouse_down_sent: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TouchScrollState {
+    last_position: Point<Pixels>,
+    locked_axis: Axis,
+}
+
+#[derive(Clone, Copy)]
+struct ScrollAnimation {
+    position: Point<Pixels>,
+    modifiers: Modifiers,
+    initial_velocity: Point<f32>,
+    gamma: f32,
+    elapsed: f32,
+    last_distance: Point<Pixels>,
+    last_frame_timestamp: Option<Duration>,
+}
+
+#[derive(Clone, Copy)]
+struct TouchSample {
+    position: Point<Pixels>,
+    timestamp: Duration,
+}
+
+#[derive(Default)]
+struct TouchVelocityTracker {
+    samples: VecDeque<TouchSample>,
+}
+
+impl TouchVelocityTracker {
+    fn reset(&mut self) {
+        self.samples.clear();
+    }
+
+    fn push(
+        &mut self,
+        position: Point<Pixels>,
+        timestamp: Option<Duration>,
+        max_sample_count: usize,
+    ) {
+        let Some(timestamp) = timestamp else {
+            return;
+        };
+
+        if self
+            .samples
+            .back()
+            .is_some_and(|sample| timestamp < sample.timestamp)
+        {
+            self.samples.clear();
+        }
+
+        self.samples.push_back(TouchSample {
+            position,
+            timestamp,
+        });
+
+        while self.samples.len() > max_sample_count {
+            self.samples.pop_front();
+        }
+    }
+
+    fn velocity(&self, locked_axis: Option<Axis>, sample_window: Duration) -> Point<f32> {
+        let Some(last_sample) = self.samples.back() else {
+            return point(0.0, 0.0);
+        };
+        let cutoff = last_sample.timestamp.saturating_sub(sample_window);
+        let samples = self
+            .samples
+            .iter()
+            .copied()
+            .filter(|sample| sample.timestamp >= cutoff)
+            .collect::<Vec<_>>();
+
+        let x = if matches!(locked_axis, Some(Axis::Vertical)) {
+            0.0
+        } else {
+            Self::axis_velocity(&samples, Axis::Horizontal).unwrap_or(0.0) as f32
+        };
+        let y = if matches!(locked_axis, Some(Axis::Horizontal)) {
+            0.0
+        } else {
+            Self::axis_velocity(&samples, Axis::Vertical).unwrap_or(0.0) as f32
+        };
+
+        point(x, y)
+    }
+
+    fn axis_velocity(samples: &[TouchSample], axis: Axis) -> Option<f64> {
+        if samples.len() < 2 {
+            return None;
+        }
+
+        Self::quadratic_axis_velocity(samples, axis)
+            .or_else(|| Self::linear_axis_velocity(samples, axis))
+    }
+
+    fn linear_axis_velocity(samples: &[TouchSample], axis: Axis) -> Option<f64> {
+        let first = samples.first()?;
+        let last = samples.last()?;
+        let elapsed = last.timestamp.checked_sub(first.timestamp)?.as_secs_f64();
+        if elapsed <= f64::EPSILON {
+            return None;
+        }
+
+        Some((Self::axis_position(last, axis) - Self::axis_position(first, axis)) / elapsed)
+    }
+
+    fn quadratic_axis_velocity(samples: &[TouchSample], axis: Axis) -> Option<f64> {
+        if samples.len() < 3 {
+            return None;
+        }
+
+        let first_timestamp = samples.first()?.timestamp;
+        let mut sum_t = 0.0;
+        let mut sum_t2 = 0.0;
+        let mut sum_t3 = 0.0;
+        let mut sum_t4 = 0.0;
+        let mut sum_position = 0.0;
+        let mut sum_t_position = 0.0;
+        let mut sum_t2_position = 0.0;
+        let mut positions = Vec::with_capacity(samples.len());
+
+        for sample in samples {
+            let t = sample.timestamp.checked_sub(first_timestamp)?.as_secs_f64();
+            let t2 = t * t;
+            let position = Self::axis_position(sample, axis);
+
+            sum_t += t;
+            sum_t2 += t2;
+            sum_t3 += t2 * t;
+            sum_t4 += t2 * t2;
+            sum_position += position;
+            sum_t_position += t * position;
+            sum_t2_position += t2 * position;
+            positions.push(position);
+        }
+
+        let last_t = samples
+            .last()?
+            .timestamp
+            .checked_sub(first_timestamp)?
+            .as_secs_f64();
+        if last_t <= f64::EPSILON {
+            return None;
+        }
+
+        let [a, b, _c] = Self::solve_3x3([
+            [sum_t4, sum_t3, sum_t2, sum_t2_position],
+            [sum_t3, sum_t2, sum_t, sum_t_position],
+            [sum_t2, sum_t, samples.len() as f64, sum_position],
+        ])?;
+
+        let velocity = 2.0 * a * last_t + b;
+        if let Some(increasing) = Self::monotonic_direction(&positions)
+            && ((increasing && velocity < 0.0) || (!increasing && velocity > 0.0))
+        {
+            return None;
+        }
+
+        Some(velocity)
+    }
+
+    fn axis_position(sample: &TouchSample, axis: Axis) -> f64 {
+        match axis {
+            Axis::Horizontal => sample.position.x.as_f32() as f64,
+            Axis::Vertical => sample.position.y.as_f32() as f64,
+        }
+    }
+
+    fn monotonic_direction(values: &[f64]) -> Option<bool> {
+        let mut direction = None;
+        for pair in values.windows(2) {
+            let delta = pair[1] - pair[0];
+            if delta.abs() <= f64::EPSILON {
+                continue;
+            }
+
+            let increasing = delta > 0.0;
+            if let Some(direction) = direction {
+                if direction != increasing {
+                    return None;
+                }
+            } else {
+                direction = Some(increasing);
+            }
+        }
+        direction
+    }
+
+    fn solve_3x3(mut matrix: [[f64; 4]; 3]) -> Option<[f64; 3]> {
+        for pivot in 0..3 {
+            let mut pivot_row = pivot;
+            for row in pivot + 1..3 {
+                if matrix[row][pivot].abs() > matrix[pivot_row][pivot].abs() {
+                    pivot_row = row;
+                }
+            }
+
+            let pivot_value = matrix[pivot_row][pivot];
+            if pivot_value.abs() <= f64::EPSILON {
+                return None;
+            }
+
+            if pivot_row != pivot {
+                matrix.swap(pivot, pivot_row);
+            }
+
+            for col in pivot..4 {
+                matrix[pivot][col] /= pivot_value;
+            }
+
+            for row in 0..3 {
+                if row == pivot {
+                    continue;
+                }
+
+                let factor = matrix[row][pivot];
+                for col in pivot..4 {
+                    matrix[row][col] -= factor * matrix[pivot][col];
+                }
+            }
+        }
+
+        Some([matrix[0][3], matrix[1][3], matrix[2][3]])
+    }
+}
+
 impl OhosWindow {
-    const TOUCH_SLOP: f32 = 8.0;
-    const MIN_MOMENTUM_VELOCITY: f32 = 180.0;
-    const MAX_MOMENTUM_VELOCITY: f32 = 4_500.0;
-    const MOMENTUM_STOP_VELOCITY: f32 = 20.0;
-    const MOMENTUM_DECAY_RATE: f32 = 3.2;
-    const VELOCITY_BLEND: f32 = 0.72;
-    const MOMENTUM_FRAME_INTERVAL: Duration = Duration::from_millis(16);
-    const MAX_MOMENTUM_GAP: Duration = Duration::from_millis(80);
+    const TOUCH_SLOP: f32 = 5.0;
+    const TAP_MAX_DURATION: Duration = Duration::from_millis(220);
+    const MIN_MOMENTUM_VELOCITY: f32 = 240.0;
+    const MAX_MOMENTUM_VELOCITY: f32 = 9_000.0;
+    const FLING_VELOCITY_SCALE: f32 = 1.5;
+    const FLING_FRICTION: f32 = 0.75;
+    const SLOW_FLING_FRICTION: f32 = 1.0;
+    const SLOW_FLING_THRESHOLD: f32 = 3_000.0;
+    const FRICTION_SCALE: f32 = 4.2;
+    const TOUCH_VELOCITY_WINDOW: Duration = Duration::from_millis(100);
+    const MAX_TOUCH_SAMPLE_COUNT: usize = 16;
+    const DEFAULT_FRAME_INTERVAL_SECONDS: f32 = 1.0 / 120.0;
+    const MIN_FRAME_INTERVAL_SECONDS: f32 = 1.0 / 240.0;
+    const MAX_FRAME_INTERVAL_SECONDS: f32 = 0.05;
+    const MIN_SCROLL_DELTA: Pixels = px(0.1);
+    const MAX_MOMENTUM_GAP: Duration = Duration::from_millis(100);
 
     pub(crate) fn new(
         app: Rc<RefCell<Option<OpenHarmonyApp>>>,
@@ -139,31 +401,64 @@ impl OhosWindow {
             gpu_context,
             foreground_executor,
             keyboard_visible: Rc::new(Cell::new(false)),
-            touch_start_position: RefCell::new(None),
-            last_touch_position: RefCell::new(None),
+            pending_touch_scroll: RefCell::new(None),
+            last_dispatched_touch_position: RefCell::new(None),
+            touch_state: Cell::new(TouchState::Idle),
+            touch_down_timestamp: Cell::new(None),
             last_touch_timestamp: Cell::new(None),
-            touch_velocity: Cell::new(point(0.0, 0.0)),
-            momentum_generation: Rc::new(Cell::new(0)),
-            touch_active: Cell::new(false),
-            touch_scrolling: Cell::new(false),
+            touch_hit_boundary: Cell::new(false),
+            touch_velocity_tracker: RefCell::new(TouchVelocityTracker::default()),
+            scroll_animation: RefCell::new(None),
+            scroll_frame_rate_boosted: Cell::new(false),
+            pending_touch_click_feedback_cancel: Cell::new(None),
         })
     }
 
     fn reset_touch_state(&self) {
-        self.touch_active.set(false);
-        self.touch_scrolling.set(false);
-        *self.touch_start_position.borrow_mut() = None;
-        *self.last_touch_position.borrow_mut() = None;
+        *self.pending_touch_scroll.borrow_mut() = None;
+        *self.last_dispatched_touch_position.borrow_mut() = None;
+        self.touch_state.set(TouchState::Idle);
+        self.touch_down_timestamp.set(None);
         self.last_touch_timestamp.set(None);
+        self.touch_hit_boundary.set(false);
     }
 
     fn cancel_momentum(&self) {
-        self.momentum_generation
-            .set(self.momentum_generation.get().wrapping_add(1));
+        *self.scroll_animation.borrow_mut() = None;
+        self.set_scroll_frame_rate_boost(false);
     }
 
     fn reset_touch_velocity(&self) {
-        self.touch_velocity.set(point(0.0, 0.0));
+        self.touch_velocity_tracker.borrow_mut().reset();
+    }
+
+    fn begin_touch_tracking(
+        &self,
+        position: Point<Pixels>,
+        timestamp: Option<Duration>,
+        synthesize_mouse_down: bool,
+    ) -> bool {
+        let canceled_momentum = self.scroll_animation.borrow().is_some();
+        self.cancel_momentum();
+        let mouse_down_sent = synthesize_mouse_down && !canceled_momentum;
+        *self.pending_touch_scroll.borrow_mut() = None;
+        *self.last_dispatched_touch_position.borrow_mut() = Some(position);
+        self.touch_state.set(TouchState::Pending(TouchPendingState {
+            start_position: position,
+            last_position: position,
+            cancel_click: canceled_momentum,
+            mouse_down_sent,
+        }));
+        self.touch_down_timestamp.set(timestamp);
+        self.last_touch_timestamp.set(timestamp);
+        self.touch_hit_boundary.set(false);
+        self.reset_touch_velocity();
+        self.record_touch_position(position, timestamp);
+        mouse_down_sent
+    }
+
+    fn movement_exceeds_touch_slop(distance_squared: f32) -> bool {
+        distance_squared > Self::TOUCH_SLOP * Self::TOUCH_SLOP
     }
 
     fn velocity_magnitude(velocity: Point<f32>) -> f32 {
@@ -181,135 +476,343 @@ impl OhosWindow {
         )
     }
 
-    fn update_touch_velocity(&self, delta: Point<Pixels>, now: Instant) {
-        let Some(previous_sample_time) = self.last_touch_timestamp.get() else {
-            self.last_touch_timestamp.set(Some(now));
-            return;
+    fn touch_timestamp(timestamp: i64) -> Option<Duration> {
+        u64::try_from(timestamp).ok().map(Duration::from_nanos)
+    }
+
+    fn touch_gap_exceeded(&self, now: Option<Duration>) -> bool {
+        let (Some(previous_sample_time), Some(now)) = (self.last_touch_timestamp.get(), now) else {
+            return false;
         };
 
-        let elapsed = now
-            .saturating_duration_since(previous_sample_time)
-            .as_secs_f32();
-        self.last_touch_timestamp.set(Some(now));
+        now.saturating_sub(previous_sample_time) > Self::MAX_MOMENTUM_GAP
+    }
 
-        if elapsed <= 0.0 {
-            return;
+    fn tap_duration_exceeded(&self, now: Option<Duration>) -> bool {
+        let (Some(touch_down_time), Some(now)) = (self.touch_down_timestamp.get(), now) else {
+            return true;
+        };
+
+        now.saturating_sub(touch_down_time) > Self::TAP_MAX_DURATION
+    }
+
+    fn record_touch_position(&self, position: Point<Pixels>, timestamp: Option<Duration>) {
+        if let Some(timestamp) = timestamp {
+            self.last_touch_timestamp.set(Some(timestamp));
         }
-
-        let instantaneous_velocity = point(delta.x.as_f32() / elapsed, delta.y.as_f32() / elapsed);
-        let previous_velocity = self.touch_velocity.get();
-        let blended_velocity = point(
-            previous_velocity.x * (1.0 - Self::VELOCITY_BLEND)
-                + instantaneous_velocity.x * Self::VELOCITY_BLEND,
-            previous_velocity.y * (1.0 - Self::VELOCITY_BLEND)
-                + instantaneous_velocity.y * Self::VELOCITY_BLEND,
+        self.touch_velocity_tracker.borrow_mut().push(
+            position,
+            timestamp,
+            Self::MAX_TOUCH_SAMPLE_COUNT,
         );
+    }
 
-        self.touch_velocity
-            .set(Self::clamp_velocity(blended_velocity));
+    fn tracked_touch_velocity(&self) -> Point<f32> {
+        self.touch_velocity_tracker
+            .borrow()
+            .velocity(self.touch_locked_axis(), Self::TOUCH_VELOCITY_WINDOW)
+    }
+
+    fn touch_locked_axis(&self) -> Option<Axis> {
+        match self.touch_state.get() {
+            TouchState::Scrolling(state) => Some(state.locked_axis),
+            TouchState::Idle | TouchState::Pending(..) => None,
+        }
+    }
+
+    fn touch_is_active(&self) -> bool {
+        !matches!(self.touch_state.get(), TouchState::Idle)
+    }
+
+    fn touch_is_scrolling(&self) -> bool {
+        matches!(self.touch_state.get(), TouchState::Scrolling(..))
+    }
+
+    fn touch_axis(delta_from_start: Point<Pixels>) -> Axis {
+        if delta_from_start.x.abs() > delta_from_start.y.abs() {
+            Axis::Horizontal
+        } else {
+            Axis::Vertical
+        }
+    }
+
+    fn filter_touch_delta(&self, delta: Point<Pixels>) -> Point<Pixels> {
+        Self::filter_touch_delta_with_axis(delta, self.touch_locked_axis())
+    }
+
+    fn filter_touch_delta_with_axis(
+        delta: Point<Pixels>,
+        locked_axis: Option<Axis>,
+    ) -> Point<Pixels> {
+        match locked_axis {
+            Some(Axis::Vertical) => point(px(0.0), delta.y),
+            Some(Axis::Horizontal) => point(delta.x, px(0.0)),
+            None => delta,
+        }
     }
 
     fn dispatch_input_with_callbacks(
         callbacks: &Rc<RefCell<WindowCallbacks>>,
         input: PlatformInput,
-    ) {
+    ) -> crate::DispatchEventResult {
         let mut callback = callbacks.borrow_mut().input.take();
+        let mut result = crate::DispatchEventResult::default();
         if let Some(ref mut cb) = callback {
-            cb(input);
+            result = cb(input);
         }
         callbacks.borrow_mut().input = callback;
+        result
     }
 
-    fn dispatch_scroll_end(&self, position: Point<Pixels>, modifiers: Modifiers) {
-        Self::dispatch_input_with_callbacks(
-            &self.callbacks,
-            PlatformInput::ScrollWheel(ScrollWheelEvent {
+    fn queue_pending_touch_scroll(
+        &self,
+        position: Point<Pixels>,
+        modifiers: Modifiers,
+        phase: TouchPhase,
+    ) {
+        let mut pending = self.pending_touch_scroll.borrow_mut();
+        if let Some(existing) = pending.as_mut() {
+            existing.position = position;
+            existing.modifiers = modifiers;
+            if matches!(existing.phase, TouchPhase::Moved) && matches!(phase, TouchPhase::Started) {
+                existing.phase = TouchPhase::Started;
+            }
+        } else {
+            *pending = Some(PendingTouchScroll {
                 position,
-                delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
                 modifiers,
-                touch_phase: TouchPhase::Ended,
-            }),
-        );
+                phase,
+            });
+        }
     }
 
-    fn start_momentum_scroll(&self, position: Point<Pixels>, modifiers: Modifiers) {
-        let Some(last_touch_timestamp) = self.last_touch_timestamp.get() else {
-            self.dispatch_scroll_end(position, modifiers);
+    fn cancel_touch_click_feedback(&self, modifiers: Modifiers) {
+        // The immediate release cancels pending clicks. The deferred release runs after GPUI has
+        // repainted the active-state mouse-up listener that is created in response to mouse-down.
+        self.dispatch_touch_click_feedback_cancel(modifiers);
+        self.pending_touch_click_feedback_cancel
+            .set(Some(modifiers));
+    }
+
+    fn dispatch_touch_click_feedback_cancel(&self, modifiers: Modifiers) {
+        self.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
+            position: point(px(-1.0), px(-1.0)),
+            modifiers,
+            click_count: 1,
+        }));
+    }
+
+    fn flush_pending_touch_click_feedback_cancel(&self) {
+        if let Some(modifiers) = self.pending_touch_click_feedback_cancel.take() {
+            self.dispatch_touch_click_feedback_cancel(modifiers);
+        }
+    }
+
+    fn clear_touch_hover_feedback(&self, modifiers: Modifiers) {
+        self.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
+            position: point(px(-1.0), px(-1.0)),
+            pressed_button: None,
+            modifiers,
+        }));
+    }
+
+    fn dispatch_touch_scroll_wheel(
+        &self,
+        scroll_wheel_event: ScrollWheelEvent,
+    ) -> crate::DispatchEventResult {
+        let modifiers = scroll_wheel_event.modifiers;
+        let result = Self::dispatch_input_with_callbacks(
+            &self.callbacks,
+            PlatformInput::ScrollWheel(scroll_wheel_event),
+        );
+        self.clear_touch_hover_feedback(modifiers);
+        result
+    }
+
+    fn flush_pending_scroll(&self) {
+        let pending = self.pending_touch_scroll.borrow_mut().take();
+        let Some(pending) = pending else {
             return;
         };
 
-        let now = Instant::now();
-        if now.saturating_duration_since(last_touch_timestamp) > Self::MAX_MOMENTUM_GAP {
-            self.dispatch_scroll_end(position, modifiers);
+        let Some(last_position) = *self.last_dispatched_touch_position.borrow() else {
+            *self.last_dispatched_touch_position.borrow_mut() = Some(pending.position);
+            return;
+        };
+
+        let delta = self.filter_touch_delta(point(
+            pending.position.x - last_position.x,
+            pending.position.y - last_position.y,
+        ));
+        *self.last_dispatched_touch_position.borrow_mut() = Some(pending.position);
+
+        if delta.x.as_f32() == 0.0 && delta.y.as_f32() == 0.0 {
             return;
         }
 
-        let initial_velocity = Self::clamp_velocity(self.touch_velocity.get());
+        let result = self.dispatch_touch_scroll_wheel(ScrollWheelEvent {
+            position: pending.position,
+            delta: ScrollDelta::Pixels(delta),
+            modifiers: pending.modifiers,
+            touch_phase: pending.phase,
+        });
+
+        self.touch_hit_boundary.set(result.propagate);
+    }
+
+    fn begin_scroll_animation(
+        &self,
+        position: Point<Pixels>,
+        modifiers: Modifiers,
+        velocity: Point<f32>,
+        friction: f32,
+    ) {
+        self.touch_hit_boundary.set(false);
+        self.set_scroll_frame_rate_boost(true);
+        *self.scroll_animation.borrow_mut() = Some(ScrollAnimation {
+            position,
+            modifiers,
+            initial_velocity: velocity,
+            gamma: friction * Self::FRICTION_SCALE,
+            elapsed: 0.0,
+            last_distance: point(px(0.0), px(0.0)),
+            last_frame_timestamp: None,
+        });
+    }
+
+    fn set_scroll_frame_rate_boost(&self, boosted: bool) {
+        if self.scroll_frame_rate_boosted.get() == boosted {
+            return;
+        }
+
+        if let Some(app) = self.app.borrow().as_ref() {
+            if boosted {
+                app.set_frame_rate(60, 120, 120);
+            } else {
+                app.set_frame_rate(30, 120, 60);
+            }
+        }
+        self.scroll_frame_rate_boosted.set(boosted);
+    }
+
+    fn scroll_frame_timestamp(event_timestamp: i64) -> Option<Duration> {
+        u64::try_from(event_timestamp)
+            .ok()
+            .map(Duration::from_nanos)
+    }
+
+    fn animation_frame_interval(
+        animation: &mut ScrollAnimation,
+        frame_timestamp: Option<Duration>,
+    ) -> f32 {
+        let Some(frame_timestamp) = frame_timestamp else {
+            return Self::DEFAULT_FRAME_INTERVAL_SECONDS;
+        };
+
+        let elapsed = animation
+            .last_frame_timestamp
+            .and_then(|last_frame_timestamp| frame_timestamp.checked_sub(last_frame_timestamp))
+            .map(|elapsed| elapsed.as_secs_f32())
+            .filter(|elapsed| *elapsed > 0.0)
+            .unwrap_or(Self::DEFAULT_FRAME_INTERVAL_SECONDS);
+
+        animation.last_frame_timestamp = Some(frame_timestamp);
+        elapsed.clamp(
+            Self::MIN_FRAME_INTERVAL_SECONDS,
+            Self::MAX_FRAME_INTERVAL_SECONDS,
+        )
+    }
+
+    fn scroll_animation_distance(velocity: Point<f32>, gamma: f32, elapsed: f32) -> Point<Pixels> {
+        if gamma <= f32::EPSILON {
+            return point(px(0.0), px(0.0));
+        }
+
+        let coefficient = (1.0 - (-gamma * elapsed).exp()) / gamma;
+        point(px(velocity.x * coefficient), px(velocity.y * coefficient))
+    }
+
+    fn scroll_animation_velocity(velocity: Point<f32>, gamma: f32, elapsed: f32) -> Point<f32> {
+        let decay = (-gamma * elapsed).exp();
+        point(velocity.x * decay, velocity.y * decay)
+    }
+
+    fn advance_scroll_animation(&self, frame_timestamp: Option<Duration>) {
+        let Some(mut animation) = self.scroll_animation.borrow_mut().take() else {
+            return;
+        };
+
+        let frame_interval = Self::animation_frame_interval(&mut animation, frame_timestamp);
+        animation.elapsed += frame_interval;
+
+        let current_distance = Self::scroll_animation_distance(
+            animation.initial_velocity,
+            animation.gamma,
+            animation.elapsed,
+        );
+        let delta = point(
+            current_distance.x - animation.last_distance.x,
+            current_distance.y - animation.last_distance.y,
+        );
+        animation.last_distance = current_distance;
+
+        let current_velocity = Self::scroll_animation_velocity(
+            animation.initial_velocity,
+            animation.gamma,
+            animation.elapsed,
+        );
+        if Self::velocity_magnitude(current_velocity) < Self::MIN_MOMENTUM_VELOCITY
+            || (delta.x.abs() < Self::MIN_SCROLL_DELTA && delta.y.abs() < Self::MIN_SCROLL_DELTA)
+        {
+            self.dispatch_scroll_end(animation.position, animation.modifiers);
+            return;
+        }
+
+        let result = self.dispatch_touch_scroll_wheel(ScrollWheelEvent {
+            position: animation.position,
+            delta: ScrollDelta::Pixels(delta),
+            modifiers: animation.modifiers,
+            touch_phase: TouchPhase::Moved,
+        });
+
+        if result.propagate {
+            self.dispatch_scroll_end(animation.position, animation.modifiers);
+            return;
+        }
+
+        *self.scroll_animation.borrow_mut() = Some(animation);
+    }
+
+    fn dispatch_scroll_end(&self, position: Point<Pixels>, modifiers: Modifiers) {
+        self.flush_pending_scroll();
+        self.touch_hit_boundary.set(false);
+        *self.scroll_animation.borrow_mut() = None;
+        self.set_scroll_frame_rate_boost(false);
+        self.dispatch_touch_scroll_wheel(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
+            modifiers,
+            touch_phase: TouchPhase::Ended,
+        });
+    }
+
+    fn start_momentum_scroll(&self, position: Point<Pixels>, modifiers: Modifiers) {
+        let touch_velocity = self.tracked_touch_velocity();
+        let friction = if Self::velocity_magnitude(touch_velocity) < Self::SLOW_FLING_THRESHOLD {
+            Self::SLOW_FLING_FRICTION
+        } else {
+            Self::FLING_FRICTION
+        };
+        let initial_velocity = Self::clamp_velocity(point(
+            touch_velocity.x * Self::FLING_VELOCITY_SCALE,
+            touch_velocity.y * Self::FLING_VELOCITY_SCALE,
+        ));
         if Self::velocity_magnitude(initial_velocity) < Self::MIN_MOMENTUM_VELOCITY {
             self.dispatch_scroll_end(position, modifiers);
             return;
         }
-
-        let callbacks = self.callbacks.clone();
-        let foreground_executor = self.foreground_executor.clone();
-        let momentum_generation = self.momentum_generation.clone();
-        let generation = momentum_generation.get();
-
-        foreground_executor
-            .spawn(async move {
-                let mut velocity = initial_velocity;
-                let mut previous_frame_time = Instant::now();
-
-                loop {
-                    smol::Timer::after(Self::MOMENTUM_FRAME_INTERVAL).await;
-
-                    if momentum_generation.get() != generation {
-                        return;
-                    }
-
-                    let now = Instant::now();
-                    let elapsed = now
-                        .saturating_duration_since(previous_frame_time)
-                        .as_secs_f32()
-                        .clamp(1.0 / 240.0, 0.05);
-                    previous_frame_time = now;
-
-                    let decay = (-Self::MOMENTUM_DECAY_RATE * elapsed).exp();
-                    velocity = point(velocity.x * decay, velocity.y * decay);
-
-                    if Self::velocity_magnitude(velocity) < Self::MOMENTUM_STOP_VELOCITY {
-                        break;
-                    }
-
-                    let delta = point(px(velocity.x * elapsed), px(velocity.y * elapsed));
-                    if delta.x.abs() < px(0.1) && delta.y.abs() < px(0.1) {
-                        break;
-                    }
-
-                    Self::dispatch_input_with_callbacks(
-                        &callbacks,
-                        PlatformInput::ScrollWheel(ScrollWheelEvent {
-                            position,
-                            delta: ScrollDelta::Pixels(delta),
-                            modifiers,
-                            touch_phase: TouchPhase::Moved,
-                        }),
-                    );
-                }
-
-                if momentum_generation.get() == generation {
-                    Self::dispatch_input_with_callbacks(
-                        &callbacks,
-                        PlatformInput::ScrollWheel(ScrollWheelEvent {
-                            position,
-                            delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
-                            modifiers,
-                            touch_phase: TouchPhase::Ended,
-                        }),
-                    );
-                }
-            })
-            .detach();
+        self.begin_scroll_animation(position, modifiers, initial_velocity, friction);
     }
 
     fn show_keyboard_if_needed(&self) {
@@ -707,7 +1210,12 @@ impl OhosWindow {
                     self.emit_resize_callback();
                 }
             }
-            Event::WindowRedraw(..) => {
+            Event::WindowRedraw(info) => {
+                self.flush_pending_scroll();
+                self.advance_scroll_animation(
+                    Self::scroll_frame_timestamp(info.target_time_stamp)
+                        .or_else(|| Self::scroll_frame_timestamp(info.time_stamp)),
+                );
                 // Take the callback out to avoid holding borrow during execution
                 // This is critical because the callback will eventually call window.draw()
                 // which may access other parts of OhosWindow
@@ -722,6 +1230,7 @@ impl OhosWindow {
                 }
                 // Put it back for next frame
                 self.callbacks.borrow_mut().request_frame = callback;
+                self.flush_pending_touch_click_feedback_cancel();
             }
             Event::Input(input_event) => {
                 self.handle_input_event(input_event);
@@ -865,99 +1374,163 @@ impl OhosWindow {
                 let scale = *self.scale.borrow();
                 let position = point(px(touch_event.x / scale), px(touch_event.y / scale));
                 let modifiers = Modifiers::default();
-                let now = Instant::now();
+                let event_timestamp = Self::touch_timestamp(touch_event.timestamp);
 
                 match touch_event.event_type {
                     TouchEvent::Down => {
-                        self.cancel_momentum();
-                        self.touch_active.set(true);
-                        self.touch_scrolling.set(false);
-                        *self.touch_start_position.borrow_mut() = Some(position);
-                        *self.last_touch_position.borrow_mut() = Some(position);
-                        self.last_touch_timestamp.set(Some(now));
-                        self.reset_touch_velocity();
-                        self.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
-                            position,
-                            pressed_button: None,
-                            modifiers,
-                        }));
+                        if self.begin_touch_tracking(position, event_timestamp, true) {
+                            self.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
+                                button: MouseButton::Left,
+                                position,
+                                modifiers,
+                                click_count: 1,
+                                first_mouse: false,
+                            }));
+                        }
                     }
                     TouchEvent::Up => {
-                        if self.touch_active.get() {
-                            if self.touch_scrolling.get() {
-                                self.start_momentum_scroll(position, modifiers);
-                            } else {
-                                self.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
-                                    button: MouseButton::Left,
-                                    position,
-                                    modifiers,
-                                    click_count: 1,
-                                    first_mouse: false,
-                                }));
-                                self.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
-                                    button: MouseButton::Left,
-                                    position,
-                                    modifiers,
-                                    click_count: 1,
-                                }));
+                        match self.touch_state.get() {
+                            TouchState::Scrolling(scroll_state) => {
+                                let velocity_is_stale = self.touch_gap_exceeded(event_timestamp);
+                                self.record_touch_position(position, event_timestamp);
+                                let delta = Self::filter_touch_delta_with_axis(
+                                    point(
+                                        position.x - scroll_state.last_position.x,
+                                        position.y - scroll_state.last_position.y,
+                                    ),
+                                    Some(scroll_state.locked_axis),
+                                );
+                                if delta.x.as_f32() != 0.0 || delta.y.as_f32() != 0.0 {
+                                    self.queue_pending_touch_scroll(
+                                        position,
+                                        modifiers,
+                                        TouchPhase::Moved,
+                                    );
+                                }
+
+                                self.flush_pending_scroll();
+                                if self.touch_hit_boundary.get() {
+                                    self.reset_touch_velocity();
+                                    self.dispatch_scroll_end(position, modifiers);
+                                } else if velocity_is_stale {
+                                    self.reset_touch_velocity();
+                                    self.dispatch_scroll_end(position, modifiers);
+                                } else {
+                                    self.start_momentum_scroll(position, modifiers);
+                                }
                             }
+                            TouchState::Pending(pending_state)
+                                if !pending_state.cancel_click
+                                    && !self.tap_duration_exceeded(event_timestamp) =>
+                            {
+                                if pending_state.mouse_down_sent {
+                                    self.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                                        button: MouseButton::Left,
+                                        position,
+                                        modifiers,
+                                        click_count: 1,
+                                    }));
+                                }
+                            }
+                            TouchState::Pending(pending_state) if pending_state.mouse_down_sent => {
+                                self.cancel_touch_click_feedback(modifiers);
+                            }
+                            TouchState::Idle | TouchState::Pending(..) => {}
                         }
 
                         self.reset_touch_state();
                     }
                     TouchEvent::Move => {
-                        let pressed = touch_event
+                        let pressed_point_count = touch_event
                             .touch_points
                             .iter()
-                            .any(|point| point.is_pressed);
+                            .filter(|point| point.is_pressed)
+                            .count();
 
-                        if !self.touch_active.get() {
-                            self.cancel_momentum();
-                            self.touch_active.set(true);
-                            self.touch_scrolling.set(false);
-                            *self.touch_start_position.borrow_mut() = Some(position);
-                            *self.last_touch_position.borrow_mut() = Some(position);
-                            self.last_touch_timestamp.set(Some(now));
-                            self.reset_touch_velocity();
+                        if !self.touch_is_active() {
+                            self.begin_touch_tracking(position, event_timestamp, false);
                         }
 
-                        let start = self.touch_start_position.borrow().unwrap_or(position);
-                        let from_start = point(position.x - start.x, position.y - start.y);
-                        let from_start_sq = from_start.x.as_f32() * from_start.x.as_f32()
-                            + from_start.y.as_f32() * from_start.y.as_f32();
-                        let slop_sq = Self::TOUCH_SLOP * Self::TOUCH_SLOP;
-                        let mut phase = TouchPhase::Moved;
-                        if !self.touch_scrolling.get() && from_start_sq > slop_sq {
-                            self.touch_scrolling.set(true);
-                            phase = TouchPhase::Started;
-                        }
-
-                        if let Some(last) = *self.last_touch_position.borrow() {
-                            let delta = point(position.x - last.x, position.y - last.y);
-                            self.update_touch_velocity(delta, now);
-                            if self.touch_scrolling.get() {
-                                if delta.x.as_f32() != 0.0 || delta.y.as_f32() != 0.0 {
-                                    self.dispatch_input(PlatformInput::ScrollWheel(
-                                        ScrollWheelEvent {
-                                            position,
-                                            delta: ScrollDelta::Pixels(delta),
-                                            modifiers,
-                                            touch_phase: phase,
-                                        },
-                                    ));
+                        match self.touch_state.get() {
+                            TouchState::Idle => {}
+                            TouchState::Pending(mut pending_state) => {
+                                if pressed_point_count > 1 {
+                                    if pending_state.mouse_down_sent {
+                                        self.cancel_touch_click_feedback(modifiers);
+                                        pending_state.mouse_down_sent = false;
+                                    }
+                                    pending_state.cancel_click = true;
                                 }
-                            } else {
-                                self.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
-                                    position,
-                                    pressed_button: pressed.then_some(MouseButton::Left),
-                                    modifiers,
-                                }));
+
+                                let from_start = point(
+                                    position.x - pending_state.start_position.x,
+                                    position.y - pending_state.start_position.y,
+                                );
+                                let from_start_sq = from_start.x.as_f32() * from_start.x.as_f32()
+                                    + from_start.y.as_f32() * from_start.y.as_f32();
+                                self.record_touch_position(position, event_timestamp);
+
+                                if Self::movement_exceeds_touch_slop(from_start_sq) {
+                                    let locked_axis = Self::touch_axis(from_start);
+                                    let delta = Self::filter_touch_delta_with_axis(
+                                        point(
+                                            position.x - pending_state.last_position.x,
+                                            position.y - pending_state.last_position.y,
+                                        ),
+                                        Some(locked_axis),
+                                    );
+
+                                    if pending_state.mouse_down_sent {
+                                        self.cancel_touch_click_feedback(modifiers);
+                                    }
+                                    self.set_scroll_frame_rate_boost(true);
+                                    *self.last_dispatched_touch_position.borrow_mut() =
+                                        Some(pending_state.last_position);
+                                    self.touch_state
+                                        .set(TouchState::Scrolling(TouchScrollState {
+                                            last_position: position,
+                                            locked_axis,
+                                        }));
+
+                                    if delta.x.as_f32() != 0.0 || delta.y.as_f32() != 0.0 {
+                                        self.queue_pending_touch_scroll(
+                                            position,
+                                            modifiers,
+                                            TouchPhase::Started,
+                                        );
+                                    }
+                                } else {
+                                    pending_state.last_position = position;
+                                    self.touch_state.set(TouchState::Pending(pending_state));
+                                }
+                            }
+                            TouchState::Scrolling(mut scroll_state) => {
+                                let raw_delta = point(
+                                    position.x - scroll_state.last_position.x,
+                                    position.y - scroll_state.last_position.y,
+                                );
+                                let delta = Self::filter_touch_delta_with_axis(
+                                    raw_delta,
+                                    Some(scroll_state.locked_axis),
+                                );
+                                self.record_touch_position(position, event_timestamp);
+                                if delta.x.as_f32() != 0.0 || delta.y.as_f32() != 0.0 {
+                                    self.queue_pending_touch_scroll(
+                                        position,
+                                        modifiers,
+                                        TouchPhase::Moved,
+                                    );
+                                }
+                                scroll_state.last_position = position;
+                                self.touch_state.set(TouchState::Scrolling(scroll_state));
                             }
                         }
-                        *self.last_touch_position.borrow_mut() = Some(position);
                     }
                     TouchEvent::Cancel | TouchEvent::Unknown => {
-                        if self.touch_active.get() && self.touch_scrolling.get() {
+                        if self.touch_is_active() {
+                            self.cancel_touch_click_feedback(modifiers);
+                        }
+                        if self.touch_is_scrolling() {
                             self.dispatch_scroll_end(position, modifiers);
                         }
                         self.cancel_momentum();
@@ -972,6 +1545,77 @@ impl OhosWindow {
 
     fn dispatch_input(&self, input: PlatformInput) {
         Self::dispatch_input_with_callbacks(&self.callbacks, input);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_sample(tracker: &mut TouchVelocityTracker, x: f32, y: f32, timestamp_ms: u64) {
+        tracker.push(
+            point(px(x), px(y)),
+            Some(Duration::from_millis(timestamp_ms)),
+            OhosWindow::MAX_TOUCH_SAMPLE_COUNT,
+        );
+    }
+
+    #[test]
+    fn velocity_tracker_uses_recent_window() {
+        let mut tracker = TouchVelocityTracker::default();
+        push_sample(&mut tracker, 0.0, 0.0, 0);
+        push_sample(&mut tracker, 40.0, 0.0, 40);
+        push_sample(&mut tracker, 120.0, 0.0, 120);
+        push_sample(&mut tracker, 200.0, 0.0, 200);
+
+        let velocity = tracker.velocity(None, Duration::from_millis(100));
+
+        assert!((velocity.x - 1_000.0).abs() < 0.01);
+        assert_eq!(velocity.y, 0.0);
+    }
+
+    #[test]
+    fn velocity_tracker_respects_axis_lock() {
+        let mut tracker = TouchVelocityTracker::default();
+        push_sample(&mut tracker, 0.0, 0.0, 0);
+        push_sample(&mut tracker, 40.0, 80.0, 40);
+        push_sample(&mut tracker, 80.0, 160.0, 80);
+
+        let velocity = tracker.velocity(Some(Axis::Vertical), Duration::from_millis(100));
+
+        assert_eq!(velocity.x, 0.0);
+        assert!((velocity.y - 2_000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn friction_distance_approaches_arkui_final_position() {
+        let gamma = OhosWindow::FLING_FRICTION * OhosWindow::FRICTION_SCALE;
+        let velocity = point(1_000.0, 0.0);
+
+        let distance = OhosWindow::scroll_animation_distance(velocity, gamma, 20.0);
+
+        assert!((distance.x.as_f32() - 1_000.0 / gamma).abs() < 0.01);
+        assert_eq!(distance.y, px(0.0));
+    }
+
+    #[test]
+    fn touch_slop_is_shared_by_tap_and_scroll_arbitration() {
+        let slop_squared = OhosWindow::TOUCH_SLOP * OhosWindow::TOUCH_SLOP;
+
+        assert!(!OhosWindow::movement_exceeds_touch_slop(slop_squared));
+        assert!(OhosWindow::movement_exceeds_touch_slop(slop_squared + 0.01));
+    }
+
+    #[test]
+    fn touch_axis_prefers_dominant_direction() {
+        assert!(matches!(
+            OhosWindow::touch_axis(point(px(12.0), px(4.0))),
+            Axis::Horizontal
+        ));
+        assert!(matches!(
+            OhosWindow::touch_axis(point(px(4.0), px(12.0))),
+            Axis::Vertical
+        ));
     }
 }
 
