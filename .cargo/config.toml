@@ -29,6 +29,8 @@ rustflags = [
 rustflags = [
     "--cfg",
     "gles",
+    "-C",
+    "target-feature=+fp16",
 ]
 
 # We need lld to link libwebrtc.a successfully on aarch64-linux

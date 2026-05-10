@@ -1,11 +1,9 @@
-// Disable command line from opening on release mode
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 mod reliability;
 mod zed;
 
 // Ensure the binary name stays in sync with APP_NAME so that the paths used
 // at runtime (data dir, config dir, etc.) match what the binary is called.
+#[cfg(not(target_env = "ohos"))]
 const _: () = assert!(
     paths::APP_NAME_LOWERCASE
         .as_bytes()
@@ -79,6 +77,9 @@ use zed::{
     handle_keymap_file_changes, initialize_workspace, open_paths_with_positions,
 };
 
+#[cfg(target_env = "ohos")]
+use openharmony_ability::OpenHarmonyApp;
+
 use crate::zed::{CrashHandler, OpenRequestKind, eager_load_active_theme_and_icon_theme};
 
 #[cfg(feature = "mimalloc")]
@@ -113,7 +114,7 @@ fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
         .collect::<Vec<_>>().join("\n\n");
 
     eprintln!("{message}: {error_details}");
-    Application::with_platform(gpui_platform::current_platform(false))
+    create_application()
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
             if let Ok(window) = cx.open_window(gpui::WindowOptions::default(), |_, cx| {
@@ -156,7 +157,7 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
     }
 
     // Maybe unify this with gpui::platform::linux::platform::ResultExt::notify_err(..)?
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(all(any(target_os = "linux", target_os = "freebsd"), not(target_env = "ohos")))]
     {
         use ashpd::desktop::notification::{Notification, NotificationProxy, Priority};
         _cx.spawn(async move |_cx| {
@@ -187,8 +188,54 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
         })
         .detach();
     }
+
+    #[cfg(target_env = "ohos")]
+    {
+        process::exit(1);
+    }
 }
 static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
+
+#[cfg(target_env = "ohos")]
+static OHOS_ENTRY_APP: OnceLock<OpenHarmonyApp> = OnceLock::new();
+
+#[cfg(target_env = "ohos")]
+pub(crate) fn set_ohos_entry_app(app: OpenHarmonyApp) {
+    if let Err(app) = OHOS_ENTRY_APP.set(app) {
+        drop(app);
+    }
+}
+
+fn create_application() -> Application {
+    #[cfg(not(target_env = "ohos"))]
+    {
+        Application::with_platform(gpui_platform::current_platform(false)).with_assets(Assets)
+    }
+
+    #[cfg(target_env = "ohos")]
+    {
+        let application = Application::with_platform(gpui_platform::current_platform(false));
+        if let Some(app) = OHOS_ENTRY_APP.get() {
+            application
+                .with_ohos_app(app.clone())
+                .with_assets(Assets)
+        } else {
+            application.with_assets(Assets)
+        }
+    }
+}
+
+#[cfg(target_env = "ohos")]
+pub(crate) fn run_with_ability_entry(app: OpenHarmonyApp) {
+    if let Some(base_path) = app.base_path().filter(|path| !path.is_empty()) {
+        let data_dir = PathBuf::from(base_path).join("zed");
+        if let Some(data_dir) = data_dir.to_str() {
+            paths::set_custom_data_dir(data_dir);
+        }
+    }
+    set_ohos_entry_app(app);
+    main();
+}
 
 fn main() {
     STARTUP_TIME.get_or_init(|| Instant::now());
@@ -338,8 +385,7 @@ fn main() {
     #[cfg(windows)]
     check_for_conpty_dll();
 
-    let app =
-        Application::with_platform(gpui_platform::current_platform(false)).with_assets(Assets);
+    let app = create_application();
 
     let app_db = db::AppDatabase::new();
     let system_id = app.background_executor().spawn(system_id());
@@ -360,7 +406,7 @@ fn main() {
     {
         false
     } else {
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        #[cfg(all(any(target_os = "linux", target_os = "freebsd"), not(target_env = "ohos")))]
         {
             crate::zed::listen_for_cli_connections(open_listener.clone()).is_err()
         }
@@ -374,6 +420,21 @@ fn main() {
         {
             use zed::mac_only_instance::*;
             ensure_only_instance() != IsOnlyInstance::Yes
+        }
+
+        #[cfg(target_env = "ohos")]
+        {
+            false
+        }
+
+        #[cfg(not(any(
+            all(any(target_os = "linux", target_os = "freebsd"), not(target_env = "ohos")),
+            target_os = "windows",
+            target_os = "macos",
+            target_env = "ohos",
+        )))]
+        {
+            false
         }
     };
     if failed_single_instance_check {

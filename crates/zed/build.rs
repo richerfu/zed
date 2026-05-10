@@ -2,8 +2,16 @@
 use std::process::Command;
 
 fn main() {
-    #[cfg(target_os = "linux")]
-    {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_env_is_ohos = target_env == "ohos";
+
+    if target_env_is_ohos {
+        napi_build_ohos::setup();
+    }
+
+    if target_os == "linux" && !target_env_is_ohos {
         // Add rpaths for libraries that webrtc-sys dlopens at runtime.
         // This is mostly required for hosts with non-standard SO installation
         // locations such as NixOS.
@@ -23,7 +31,7 @@ fn main() {
         }
     }
 
-    if cfg!(target_os = "macos") {
+    if target_os == "macos" {
         println!("cargo:rustc-env=MACOSX_DEPLOYMENT_TARGET=10.15.7");
 
         // Weakly link ReplayKit to ensure Zed can be used on macOS 10.15+.
@@ -82,13 +90,13 @@ fn main() {
         }
     }
 
-    if cfg!(windows) {
-        if cfg!(target_env = "msvc") {
+    if target_os == "windows" {
+        if target_env == "msvc" {
             // todo(windows): This is to avoid stack overflow. Remove it when solved.
             println!("cargo:rustc-link-arg=/stack:{}", 8 * 1024 * 1024);
         }
 
-        if cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64") {
+        if target_arch == "x86_64" || target_arch == "aarch64" {
             let out_dir = std::env::var("OUT_DIR").unwrap();
             let out_dir: &std::path::Path = out_dir.as_ref();
             let target_dir = std::path::Path::new(&out_dir)
@@ -136,7 +144,7 @@ fn main() {
                     match extract_result {
                         Ok(output) if output.status.success() => {
                             let (conpty_dll_source, open_console_source) =
-                                if cfg!(target_arch = "x86_64") {
+                                if target_arch == "x86_64" {
                                     (
                                         extract_dir.join("runtimes/win-x64/native/conpty.dll"),
                                         extract_dir
@@ -211,11 +219,11 @@ fn main() {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    prepare_app_icon_x11();
+    if (target_os == "linux" || target_os == "freebsd") && !target_env_is_ohos {
+        prepare_app_icon_x11();
+    }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn icon_path() -> std::path::PathBuf {
     use std::str::FromStr;
 
@@ -236,7 +244,6 @@ fn icon_path() -> std::path::PathBuf {
     std::path::PathBuf::from_str(&icon).unwrap()
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn prepare_app_icon_x11() {
     use image::{ImageReader, imageops};
     use std::env;

@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+arch="${OHOS_ARCH:-aarch}"
+crate="${OHOS_CRATE:-zed}"
+shell_project="${OHOS_SHELL_PROJECT:-/Volumes/PSSD/code/harmony/clash_hmeta}"
+lib_dir="${OHOS_SHELL_LIB_DIR:-$shell_project/entry/libs/arm64-v8a}"
+hap_path="${OHOS_HAP_PATH:-$shell_project/entry/build/default/outputs/default/entry-default-signed.hap}"
+bundle="${OHOS_BUNDLE:-com.richerfu.clash_hmeta}"
+ability="${OHOS_ABILITY:-EntryAbility}"
+hvigorw="${OHOS_HVIGORW:-/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw}"
+
+if [[ -n "${OHOS_TARGET:-}" ]]; then
+  target="$OHOS_TARGET"
+else
+  target="$(hdc list targets | sed -n '1p')"
+fi
+
+if [[ -z "$target" || "$target" == "[Empty]" ]]; then
+  echo "No OHOS target found. Set OHOS_TARGET or connect/start a device." >&2
+  exit 1
+fi
+
+cd "$repo_root"
+
+echo "==> Building $crate for OHOS ($arch)"
+ohrs build --arch "$arch" -p "$crate"
+
+lib_path="$repo_root/target/aarch64-unknown-linux-ohos/debug/lib${crate}.so"
+if [[ ! -f "$lib_path" ]]; then
+  echo "Built library not found: $lib_path" >&2
+  exit 1
+fi
+
+echo "==> Copying $(basename "$lib_path") to $lib_dir"
+mkdir -p "$lib_dir"
+cp "$lib_path" "$lib_dir/"
+
+echo "==> Building HAP in $shell_project"
+cd "$shell_project"
+"$hvigorw" assembleHap
+
+if [[ ! -f "$hap_path" ]]; then
+  echo "HAP not found: $hap_path" >&2
+  exit 1
+fi
+
+echo "==> Installing HAP to $target"
+hdc -t "$target" install -r "$hap_path"
+
+echo "==> Clearing logs and restarting $bundle/$ability"
+hdc -t "$target" shell hilog -r
+hdc -t "$target" shell aa force-stop "$bundle" || true
+hdc -t "$target" shell aa start -b "$bundle" -a "$ability"
+
+echo "==> Started on $target"

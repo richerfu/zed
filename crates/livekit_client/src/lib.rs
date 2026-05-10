@@ -1,9 +1,13 @@
 use anyhow::Context as _;
 use collections::HashMap;
+#[cfg(target_env = "ohos")]
+use audio::DeviceId;
+#[cfg(not(target_env = "ohos"))]
 use cpal::DeviceId;
 
 mod remote_video_track_view;
 pub use remote_video_track_view::{RemoteVideoTrackView, RemoteVideoTrackViewEvent};
+#[cfg(not(target_env = "ohos"))]
 use rodio::DeviceTrait as _;
 
 mod record;
@@ -14,6 +18,7 @@ pub use record::CaptureInput;
     not(any(
         test,
         feature = "test-support",
+        target_env = "ohos",
         all(target_os = "windows", target_env = "gnu"),
         target_os = "freebsd"
     ))
@@ -24,6 +29,7 @@ mod livekit_client;
     not(any(
         test,
         feature = "test-support",
+        target_env = "ohos",
         all(target_os = "windows", target_env = "gnu"),
         target_os = "freebsd"
     ))
@@ -35,6 +41,7 @@ pub use livekit_client::*;
     any(
         test,
         feature = "test-support",
+        target_env = "ohos",
         all(target_os = "windows", target_env = "gnu"),
         target_os = "freebsd"
     )
@@ -45,6 +52,7 @@ mod mock_client;
     any(
         test,
         feature = "test-support",
+        target_env = "ohos",
         all(target_os = "windows", target_env = "gnu"),
         target_os = "freebsd"
     )
@@ -55,6 +63,7 @@ pub mod test;
     any(
         test,
         feature = "test-support",
+        target_env = "ohos",
         all(target_os = "windows", target_env = "gnu"),
         target_os = "freebsd"
     )
@@ -202,6 +211,7 @@ pub enum RoomEvent {
     Reconnected,
 }
 
+#[cfg(not(target_env = "ohos"))]
 pub(crate) fn default_device(
     input: bool,
     device_id: Option<&DeviceId>,
@@ -219,6 +229,7 @@ pub(crate) fn default_device(
     Ok((device, config))
 }
 
+#[cfg(not(target_env = "ohos"))]
 pub(crate) fn get_sample_data(
     sample_format: cpal::SampleFormat,
     data: &cpal::Data,
@@ -239,6 +250,7 @@ pub(crate) fn get_sample_data(
     }
 }
 
+#[cfg(not(target_env = "ohos"))]
 pub(crate) fn convert_sample_data<
     TSource: cpal::SizedSample,
     TDest: cpal::SizedSample + cpal::FromSample<TSource>,

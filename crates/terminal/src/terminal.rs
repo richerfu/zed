@@ -1112,7 +1112,10 @@ impl Terminal {
                         selection.update(point, AlacDirection::Right);
                         term.selection = Some(selection);
 
-                        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                        #[cfg(all(
+                            any(target_os = "linux", target_os = "freebsd"),
+                            not(target_env = "ohos")
+                        ))]
                         if let Some(selection_text) = term.selection_to_string() {
                             cx.write_to_primary(ClipboardItem::new_string(selection_text));
                         }
@@ -1126,7 +1129,10 @@ impl Terminal {
                 trace!("Setting selection: selection={selection:?}");
                 term.selection = selection.as_ref().map(|(sel, _)| sel.clone());
 
-                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                #[cfg(all(
+                    any(target_os = "linux", target_os = "freebsd"),
+                    not(target_env = "ohos")
+                ))]
                 if let Some(selection_text) = term.selection_to_string() {
                     cx.write_to_primary(ClipboardItem::new_string(selection_text));
                 }
@@ -1148,7 +1154,10 @@ impl Terminal {
                     selection.update(point, side);
                     term.selection = Some(selection);
 
-                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                    #[cfg(all(
+                        any(target_os = "linux", target_os = "freebsd"),
+                        not(target_env = "ohos")
+                    ))]
                     if let Some(selection_text) = term.selection_to_string() {
                         cx.write_to_primary(ClipboardItem::new_string(selection_text));
                     }
@@ -1967,7 +1976,10 @@ impl Terminal {
                             .push_back(InternalEvent::SetSelection(Some((sel, point))));
                     }
                 }
-                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                #[cfg(all(
+                    any(target_os = "linux", target_os = "freebsd"),
+                    not(target_env = "ohos")
+                ))]
                 MouseButton::Middle => {
                     if let Some(item) = _cx.read_from_primary() {
                         let text = item.text().unwrap_or_default();

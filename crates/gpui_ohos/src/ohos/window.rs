@@ -13,6 +13,7 @@ use anyhow::Result;
 use futures::channel::oneshot;
 use openharmony_ability::{
     AvoidAreaType, Event, ImeEvent, InputEvent, OpenHarmonyApp, xcomponent::TouchEvent,
+    xcomponent::TouchEventData,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
@@ -29,15 +30,18 @@ use crate::{
 };
 
 pub(crate) struct OhosWindow {
+    handle: crate::AnyWindowHandle,
     app: Rc<RefCell<Option<OpenHarmonyApp>>>,
     bounds: RefCell<Bounds<Pixels>>,
     scale: RefCell<f32>,
     keyboard_overlap_device_px: Cell<i32>,
     safe_area_avoidance_enabled: Cell<bool>,
+    last_emitted_resize: RefCell<Option<ResizeCallbackState>>,
     input_handler: Rc<RefCell<Option<PlatformInputHandler>>>,
     callbacks: Rc<RefCell<WindowCallbacks>>,
+    pending_frame_request: Cell<Option<bool>>,
     renderer: RefCell<Option<WgpuRenderer>>,
-    gpu_context: Arc<WgpuContext>,
+    gpu_context: Rc<RefCell<Option<Arc<WgpuContext>>>>,
     foreground_executor: ForegroundExecutor,
     keyboard_visible: Rc<Cell<bool>>,
     pending_touch_scroll: RefCell<Option<PendingTouchScroll>>,
@@ -89,6 +93,12 @@ struct WindowCallbacks {
     close: Option<Box<dyn FnOnce()>>,
     appearance_changed: Option<Box<dyn FnMut()>>,
     hit_test_window_control: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
+}
+
+#[derive(Clone, Copy)]
+struct ResizeCallbackState {
+    content_size: Size<Pixels>,
+    scale: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -361,9 +371,9 @@ impl OhosWindow {
 
     pub(crate) fn new(
         app: Rc<RefCell<Option<OpenHarmonyApp>>>,
-        _handle: crate::AnyWindowHandle,
+        handle: crate::AnyWindowHandle,
         params: WindowParams,
-        gpu_context: Arc<WgpuContext>,
+        gpu_context: Rc<RefCell<Option<Arc<WgpuContext>>>>,
         foreground_executor: ForegroundExecutor,
     ) -> Result<Self> {
         let scale = app
@@ -371,18 +381,19 @@ impl OhosWindow {
             .as_ref()
             .map(|a| a.scale() as f32)
             .unwrap_or(1.0);
-        let bounds = params.bounds;
-
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), params.bounds.size);
         // Don't create renderer immediately - native_window may not be available yet.
         // Renderer will be initialized lazily in draw() or when SurfaceCreate event is received.
         // At that point, native_window from OpenHarmonyApp will be available.
 
         Ok(Self {
+            handle,
             app: app.clone(),
             bounds: RefCell::new(bounds),
             scale: RefCell::new(scale),
             keyboard_overlap_device_px: Cell::new(0),
             safe_area_avoidance_enabled: Cell::new(true),
+            last_emitted_resize: RefCell::new(None),
             input_handler: Rc::new(RefCell::new(None)),
             callbacks: Rc::new(RefCell::new(WindowCallbacks {
                 request_frame: None,
@@ -397,6 +408,7 @@ impl OhosWindow {
                 appearance_changed: None,
                 hit_test_window_control: None,
             })),
+            pending_frame_request: Cell::new(None),
             renderer: RefCell::new(None),
             gpu_context,
             foreground_executor,
@@ -414,6 +426,10 @@ impl OhosWindow {
         })
     }
 
+    pub(crate) fn handle(&self) -> crate::AnyWindowHandle {
+        self.handle
+    }
+
     fn reset_touch_state(&self) {
         *self.pending_touch_scroll.borrow_mut() = None;
         *self.last_dispatched_touch_position.borrow_mut() = None;
@@ -421,6 +437,29 @@ impl OhosWindow {
         self.touch_down_timestamp.set(None);
         self.last_touch_timestamp.set(None);
         self.touch_hit_boundary.set(false);
+    }
+
+    fn size_matches(left: Size<Pixels>, right: Size<Pixels>) -> bool {
+        const EPSILON: f32 = 0.01;
+
+        (left.width.as_f32() - right.width.as_f32()).abs() <= EPSILON
+            && (left.height.as_f32() - right.height.as_f32()).abs() <= EPSILON
+    }
+
+    fn resize_state_matches(left: ResizeCallbackState, right: ResizeCallbackState) -> bool {
+        const EPSILON: f32 = 0.01;
+
+        Self::size_matches(left.content_size, right.content_size)
+            && (left.scale - right.scale).abs() <= EPSILON
+    }
+
+    fn set_bounds_size(&self, new_size: Size<Pixels>) -> bool {
+        if Self::size_matches(self.bounds.borrow().size, new_size) {
+            return false;
+        }
+
+        *self.bounds.borrow_mut() = Bounds::new(point(px(0.0), px(0.0)), new_size);
+        true
     }
 
     fn cancel_momentum(&self) {
@@ -478,6 +517,11 @@ impl OhosWindow {
 
     fn touch_timestamp(timestamp: i64) -> Option<Duration> {
         u64::try_from(timestamp).ok().map(Duration::from_nanos)
+    }
+
+    fn touch_position(&self, touch_event: &TouchEventData) -> Point<Pixels> {
+        let scale = *self.scale.borrow();
+        point(px(touch_event.x / scale), px(touch_event.y / scale))
     }
 
     fn touch_gap_exceeded(&self, now: Option<Duration>) -> bool {
@@ -1042,12 +1086,54 @@ impl OhosWindow {
     fn emit_resize_callback(&self) {
         let scale = *self.scale.borrow();
         let content_size = self.effective_content_size();
+        let resize_state = ResizeCallbackState {
+            content_size,
+            scale,
+        };
 
         let mut callback = self.callbacks.borrow_mut().resize.take();
+        if callback.is_none() {
+            self.callbacks.borrow_mut().resize = callback;
+            return;
+        }
+
+        {
+            let mut last_emitted_resize = self.last_emitted_resize.borrow_mut();
+            if last_emitted_resize
+                .as_ref()
+                .copied()
+                .is_some_and(|last_resize| Self::resize_state_matches(last_resize, resize_state))
+            {
+                self.callbacks.borrow_mut().resize = callback;
+                return;
+            }
+            *last_emitted_resize = Some(resize_state);
+        }
+
         if let Some(ref mut cb) = callback {
             cb(content_size, scale);
         }
         self.callbacks.borrow_mut().resize = callback;
+    }
+
+    fn request_frame(&self, force_render: bool) {
+        let mut callback = self.callbacks.borrow_mut().request_frame.take();
+        if let Some(ref mut callback) = callback {
+            self.pending_frame_request.set(None);
+            callback(RequestFrameOptions {
+                require_presentation: force_render,
+                force_render,
+            });
+        } else {
+            let force_render = self
+                .pending_frame_request
+                .take()
+                .is_some_and(|pending_force_render| pending_force_render)
+                || force_render;
+            self.pending_frame_request.set(Some(force_render));
+            warn!("OhosWindow: request_frame called before callback was set");
+        }
+        self.callbacks.borrow_mut().request_frame = callback;
     }
 
     /// Initialize the renderer when native_window becomes available (after SurfaceCreate event).
@@ -1092,22 +1178,13 @@ impl OhosWindow {
             self.bounds.borrow().size.height.as_f32() as u32
         };
 
-        debug!(
-            "OhosWindow: Initializing renderer with size {}x{}",
-            device_width, device_height
-        );
-
         // Update window bounds to match actual content_rect (convert device px -> logical px)
         if content_rect.width > 0 && content_rect.height > 0 {
             let logical_size = size(
                 px(device_width as f32 / scale),
                 px(device_height as f32 / scale),
             );
-            let logical_origin = point(
-                px(content_rect.left as f32 / scale),
-                px(content_rect.top as f32 / scale),
-            );
-            *self.bounds.borrow_mut() = Bounds::new(logical_origin, logical_size);
+            *self.bounds.borrow_mut() = Bounds::new(point(px(0.0), px(0.0)), logical_size);
         }
 
         let config = WgpuSurfaceConfig {
@@ -1125,47 +1202,47 @@ impl OhosWindow {
 
         // Debug: Check window handle before creating renderer
         match self.window_handle() {
-            Ok(handle) => {
-                debug!(
-                    "OhosWindow: Window handle obtained successfully: {:?}",
-                    handle.as_raw()
-                );
-            }
+            Ok(_) => {}
             Err(e) => {
-                warn!("OhosWindow: Failed to get window handle: {:?}", e);
+                warn!("failed to get OHOS window handle: {:?}", e);
                 return Err(anyhow::anyhow!("Window handle not available: {:?}", e));
             }
         }
 
-        debug!("OhosWindow: Creating WgpuRenderer...");
+        let gpu_context = if let Some(gpu_context) = self.gpu_context.borrow().clone() {
+            gpu_context
+        } else {
+            let gpu_context = Arc::new(WgpuContext::new().map_err(|error| {
+                warn!("failed to create OHOS GPU context: {error}");
+                anyhow::anyhow!("Failed to create GPU context: {error}")
+            })?);
+            *self.gpu_context.borrow_mut() = Some(gpu_context.clone());
+            gpu_context
+        };
 
         // Create renderer using the window's HasWindowHandle and HasDisplayHandle implementation
         // which will get the raw_window_handle from native_window
-        let renderer = WgpuRenderer::new(&self.gpu_context, self, config)
+        let renderer = WgpuRenderer::new(&gpu_context, self, config)
             .map_err(|e| {
-                warn!("OhosWindow: WgpuRenderer::new failed: {}", e);
+                warn!("failed to initialize OHOS renderer: {}", e);
                 anyhow::anyhow!("Failed to create Wgpu renderer: {}. Make sure native_window is available from OpenHarmonyApp.", e)
             })?;
 
         *renderer_guard = Some(renderer);
-        debug!("OhosWindow: Renderer initialized successfully");
         Ok(())
     }
 
     pub(crate) fn handle_event(&self, event: &Event) {
         match event {
             Event::SurfaceCreate => {
-                debug!("OhosWindow: SurfaceCreate event received - initializing renderer");
                 // Initialize renderer when SurfaceCreate event is received
                 // Note: on_finish_launching is handled at the platform level (OhosPlatform::handle_ohos_event)
                 // before windows are created.
                 match self.initialize_renderer() {
-                    Ok(()) => {
-                        debug!("OhosWindow: Renderer initialized successfully");
-                    }
+                    Ok(()) => {}
                     Err(e) => {
                         warn!(
-                            "OhosWindow: Failed to initialize renderer: {}. Make sure native_window is available from OpenHarmonyApp.",
+                            "SurfaceCreate failed to initialize OHOS renderer: {}. Make sure native_window is available from OpenHarmonyApp.",
                             e
                         );
                     }
@@ -1173,25 +1250,28 @@ impl OhosWindow {
                 if self.refresh_keyboard_overlap_device_px() {
                     self.emit_resize_callback();
                 }
+                self.request_frame(true);
             }
             Event::WindowResize(ohos_size) => {
                 let scale = *self.scale.borrow();
                 let width = ohos_size.width as f32;
                 let height = ohos_size.height as f32;
                 let new_size = size(px(width / scale), px(height / scale));
-                let origin = self.bounds.borrow().origin;
-                *self.bounds.borrow_mut() = Bounds::new(origin, new_size);
-                self.refresh_keyboard_overlap_device_px();
+                let bounds_changed = self.set_bounds_size(new_size);
+                let keyboard_overlap_changed = self.refresh_keyboard_overlap_device_px();
 
                 // Update renderer's drawable size
-                if let Some(ref mut renderer) = *self.renderer.borrow_mut() {
+                if bounds_changed && let Some(ref mut renderer) = *self.renderer.borrow_mut() {
                     let device_size = Size {
                         width: DevicePixels(width as i32),
                         height: DevicePixels(height as i32),
                     };
                     renderer.update_drawable_size(device_size);
                 }
-                self.emit_resize_callback();
+                if bounds_changed || keyboard_overlap_changed {
+                    self.emit_resize_callback();
+                    self.request_frame(true);
+                }
             }
             Event::ContentRectChange(..) => {
                 if self.refresh_keyboard_overlap_device_px() {
@@ -1216,20 +1296,7 @@ impl OhosWindow {
                     Self::scroll_frame_timestamp(info.target_time_stamp)
                         .or_else(|| Self::scroll_frame_timestamp(info.time_stamp)),
                 );
-                // Take the callback out to avoid holding borrow during execution
-                // This is critical because the callback will eventually call window.draw()
-                // which may access other parts of OhosWindow
-                let mut callback = self.callbacks.borrow_mut().request_frame.take();
-                if let Some(ref mut cb) = callback {
-                    cb(RequestFrameOptions {
-                        require_presentation: true,
-                        force_render: false,
-                    });
-                } else {
-                    warn!("OhosWindow: WindowRedraw event but no request_frame callback set");
-                }
-                // Put it back for next frame
-                self.callbacks.borrow_mut().request_frame = callback;
+                self.request_frame(false);
                 self.flush_pending_touch_click_feedback_cancel();
             }
             Event::Input(input_event) => {
@@ -1263,9 +1330,13 @@ impl OhosWindow {
                     .as_ref()
                     .map(|a| a.scale() as f32)
                     .unwrap_or(1.0);
+                let scale_changed = (*self.scale.borrow() - new_scale).abs() > f32::EPSILON;
                 *self.scale.borrow_mut() = new_scale;
-                self.refresh_keyboard_overlap_device_px();
-                self.emit_resize_callback();
+                let keyboard_overlap_changed = self.refresh_keyboard_overlap_device_px();
+                if scale_changed || keyboard_overlap_changed {
+                    self.emit_resize_callback();
+                    self.request_frame(true);
+                }
             }
             Event::WindowDestroy => {
                 self.cancel_momentum();
@@ -1371,8 +1442,7 @@ impl OhosWindow {
                     .detach();
             }
             InputEvent::TouchEvent(touch_event) => {
-                let scale = *self.scale.borrow();
-                let position = point(px(touch_event.x / scale), px(touch_event.y / scale));
+                let position = self.touch_position(touch_event);
                 let modifiers = Modifiers::default();
                 let event_timestamp = Self::touch_timestamp(touch_event.timestamp);
 
@@ -1877,8 +1947,7 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
-        let origin = self.bounds.borrow().origin;
-        *self.bounds.borrow_mut() = Bounds::new(origin, size);
+        *self.bounds.borrow_mut() = Bounds::new(point(px(0.0), px(0.0)), size);
     }
 
     fn scale_factor(&self) -> f32 {
@@ -1969,6 +2038,9 @@ impl PlatformWindow for OhosWindow {
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.callbacks.borrow_mut().request_frame = Some(callback);
+        if let Some(force_render) = self.pending_frame_request.take() {
+            self.request_frame(force_render);
+        }
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> crate::DispatchEventResult>) {
@@ -2024,7 +2096,7 @@ impl PlatformWindow for OhosWindow {
         // This ensures native_window is available (after SurfaceCreate event)
         if self.renderer.borrow().is_none() {
             if let Err(e) = self.initialize_renderer() {
-                warn!("OhosWindow: Failed to initialize renderer in draw(): {}", e);
+                warn!("failed to initialize OHOS renderer in draw(): {}", e);
                 return;
             }
         }
@@ -2033,7 +2105,7 @@ impl PlatformWindow for OhosWindow {
         if let Some(ref mut renderer) = *self.renderer.borrow_mut() {
             renderer.draw(scene);
         } else {
-            warn!("OhosWindow: draw called but renderer is not available");
+            warn!("draw called but OHOS renderer is not available");
         }
     }
 

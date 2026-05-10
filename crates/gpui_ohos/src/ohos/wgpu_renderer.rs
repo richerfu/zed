@@ -1158,7 +1158,6 @@ impl WgpuRenderer {
                 return;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
-                log::error!("Failed to acquire surface texture: validation error");
                 return;
             }
         };

@@ -3,9 +3,13 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use cpal::DeviceId;
 use gpui::App;
 use settings::{RegisterSetting, Settings, SettingsStore};
+
+#[cfg(not(target_env = "ohos"))]
+pub use cpal::DeviceId;
+#[cfg(target_env = "ohos")]
+pub type DeviceId = String;
 
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct AudioSettings {

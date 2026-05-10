@@ -144,7 +144,9 @@ impl PlatformDispatcher for OhosDispatcher {
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, priority: Priority) {
         match self.main_sender.send(priority, runnable) {
             Ok(_) => {
-                // Task has been queued, it will be processed in the run_loop callback
+                if let Some(waker) = self.waker.lock().unwrap().as_ref() {
+                    waker.wake();
+                }
             }
             Err(runnable) => {
                 // NOTE: Runnable may wrap a Future that is !Send.
@@ -168,6 +170,9 @@ impl PlatformDispatcher for OhosDispatcher {
             runnable,
         });
         cvar.notify_one();
+        if let Some(waker) = self.waker.lock().unwrap().as_ref() {
+            waker.wake();
+        }
     }
 
     fn spawn_realtime(&self, f: Box<dyn FnOnce() + Send>) {

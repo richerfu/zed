@@ -1,4 +1,4 @@
-use log::{debug, warn};
+use log::warn;
 
 use std::{
     cell::RefCell,
@@ -32,7 +32,7 @@ pub(crate) struct OhosPlatform {
     text_system: Arc<dyn PlatformTextSystem>,
     primary_display: Rc<RefCell<Option<OhosDisplay>>>,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
-    gpu_context: Arc<WgpuContext>,
+    gpu_context: Rc<RefCell<Option<Arc<WgpuContext>>>>,
     windows: Rc<RefCell<Vec<Weak<RefCell<OhosWindow>>>>>,
 }
 
@@ -44,18 +44,6 @@ impl OhosPlatform {
         let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
         let text_system = Arc::new(OhosTextSystem::new());
 
-        // Initialize GPU context for WGPU renderer.
-        // Note: ZED_DEVICE_ID environment variable is optional - if not set, device_id defaults to 0
-        let gpu_context = Arc::new(WgpuContext::new()
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to create GPU context: {}. \
-                    Note: ZED_DEVICE_ID environment variable is optional. \
-                    If you need to specify a GPU device, set ZED_DEVICE_ID to a 4-digit hex PCI ID (e.g., '0x1234').",
-                    e
-                )
-            })?);
-
         Ok(Self {
             app: Rc::new(RefCell::new(None)),
             dispatcher,
@@ -64,7 +52,7 @@ impl OhosPlatform {
             text_system,
             primary_display: Rc::new(RefCell::new(None)),
             main_receiver,
-            gpu_context,
+            gpu_context: Rc::new(RefCell::new(None)),
             windows: Rc::new(RefCell::new(Vec::new())),
         })
     }
@@ -90,12 +78,10 @@ impl OhosPlatform {
     }
 
     fn handle_ohos_event(&self, event: &Event, on_finish_launching: Option<Box<dyn FnOnce()>>) {
-        // First, process any GPUI tasks queued for the main thread
-        // This ensures tasks are processed in the run_loop, integrating GPUI with OpenHarmony's event loop
-        self.run_foreground_tasks();
-
         if matches!(event, Event::UserEvent) {
             self.dispatcher.run_due_timers();
+            self.run_foreground_tasks();
+            return;
         }
 
         // Handle on_finish_launching callback first, before routing to windows.
@@ -105,12 +91,11 @@ impl OhosPlatform {
         // Note: The callback is only passed when event is SurfaceCreate (checked in run() method),
         // so we can safely call it here unconditionally.
         if let Some(callback) = on_finish_launching {
-            debug!("OhosPlatform: Calling on_finish_launching on SurfaceCreate");
             callback();
         }
 
-        // Route events to all known OHOS windows without borrowing App.
-        // This avoids RefCell borrow conflicts when callbacks trigger app updates.
+        // OHOS NativeAbility exposes a single XComponent surface. Broadcasting surface/input events
+        // to every GPUI platform window lets stale or background windows consume the same event.
         let mut live_windows: Vec<Rc<RefCell<OhosWindow>>> = Vec::new();
         {
             let mut windows = self.windows.borrow_mut();
@@ -124,11 +109,7 @@ impl OhosPlatform {
             });
         }
 
-        if live_windows.is_empty() {
-            warn!("OhosPlatform: No active windows to handle event");
-        }
-
-        for window in live_windows {
+        if let Some(window) = live_windows.last() {
             window.borrow().handle_event(event);
         }
     }
@@ -178,7 +159,7 @@ impl Platform for OhosPlatform {
                 platform.handle_ohos_event(&event, callback);
             });
         } else {
-            warn!("OhosPlatform: App not set");
+            warn!("platform run_loop not started because app is not set");
         }
     }
 
@@ -232,12 +213,32 @@ impl Platform for OhosPlatform {
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
-        // OHOS typically has a single window
-        None
+        let mut active_window = None;
+        let mut windows = self.windows.borrow_mut();
+        windows.retain(|weak| {
+            let Some(window) = weak.upgrade() else {
+                return false;
+            };
+
+            active_window = Some(window.borrow().handle());
+            true
+        });
+        active_window
     }
 
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>> {
-        None
+        let mut window_stack = Vec::new();
+        let mut windows = self.windows.borrow_mut();
+        windows.retain(|weak| {
+            let Some(window) = weak.upgrade() else {
+                return false;
+            };
+
+            window_stack.push(window.borrow().handle());
+            true
+        });
+        window_stack.reverse();
+        Some(window_stack)
     }
 
     fn is_screen_capture_supported(&self) -> bool {

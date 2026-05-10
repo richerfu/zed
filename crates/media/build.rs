@@ -12,11 +12,22 @@ fn main() {
     )
     .unwrap();
     let sdk_path = sdk_path.trim_end();
+    let target = env::var("TARGET").unwrap();
+    if !target.ends_with("-apple-darwin") {
+        return;
+    }
 
     println!("cargo:rerun-if-changed=src/bindings.h");
     let bindings = bindgen::Builder::default()
         .header("src/bindings.h")
+        .clang_arg(format!("--target={target}"))
         .clang_arg(format!("-isysroot{}", sdk_path))
+        .clang_arg("-F")
+        .clang_arg(format!("{sdk_path}/System/Library/Frameworks"))
+        .clang_arg("-D__LP64__=1")
+        .clang_arg("-DTARGET_OS_OSX=1")
+        .clang_arg("-DTARGET_OS_MAC=1")
+        .clang_arg("-DTARGET_OS_IPHONE=0")
         .clang_arg("-xobjective-c")
         .allowlist_type("CMItemIndex")
         .allowlist_type("CMSampleTimingInfo")

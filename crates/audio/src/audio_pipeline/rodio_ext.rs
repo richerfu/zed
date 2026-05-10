@@ -8,7 +8,10 @@ use std::{
 };
 
 use crossbeam::queue::ArrayQueue;
+#[cfg(not(target_env = "ohos"))]
 use denoise::{Denoiser, DenoiserError};
+#[cfg(target_env = "ohos")]
+use ohos_denoise::{Denoiser, DenoiserError};
 use log::warn;
 use rodio::{
     ChannelCount, Sample, SampleRate, Source, conversions::SampleRateConverter, nz,
@@ -16,6 +19,57 @@ use rodio::{
 };
 
 const MAX_CHANNELS: usize = 8;
+
+#[cfg(target_env = "ohos")]
+mod ohos_denoise {
+    use std::fmt;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("denoise is not available on OHOS")]
+    pub struct DenoiserError;
+
+    pub struct Denoiser<S>(S);
+
+    impl<S: rodio::Source> Denoiser<S> {
+        pub fn try_new(source: S) -> Result<Self, DenoiserError> {
+            Ok(Self(source))
+        }
+
+        pub fn set_enabled(&mut self, _enabled: bool) {}
+    }
+
+    impl<S: rodio::Source> fmt::Debug for Denoiser<S> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Denoiser").finish_non_exhaustive()
+        }
+    }
+
+    impl<S: rodio::Source> Iterator for Denoiser<S> {
+        type Item = rodio::Sample;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.0.next()
+        }
+    }
+
+    impl<S: rodio::Source> rodio::Source for Denoiser<S> {
+        fn current_span_len(&self) -> Option<usize> {
+            self.0.current_span_len()
+        }
+
+        fn channels(&self) -> rodio::ChannelCount {
+            self.0.channels()
+        }
+
+        fn sample_rate(&self) -> rodio::SampleRate {
+            self.0.sample_rate()
+        }
+
+        fn total_duration(&self) -> Option<std::time::Duration> {
+            self.0.total_duration()
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("Replay duration is too short must be >= 100ms")]
