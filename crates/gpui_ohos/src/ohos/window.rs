@@ -11,6 +11,8 @@ use anyhow::Result;
 use futures::channel::oneshot;
 use openharmony_ability::{
     AvoidAreaType, Event, GestureEvent, GesturePhase, ImeEvent, InputEvent, OpenHarmonyApp,
+    arkui::arkui_input_binding::{UIInputAction, UIInputToolType},
+    xcomponent::{MouseAction, TouchEvent},
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
@@ -19,12 +21,15 @@ use super::wgpu_context::WgpuContext;
 use super::wgpu_renderer::{WgpuRenderer, WgpuSurfaceConfig};
 use crate::{
     Bounds, Capslock, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers, MouseButton,
-    MouseDownEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    ResizeEdge, Scene, ScrollDelta, ScrollWheelEvent, Size, TouchPhase, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
-    WindowParams, point, px, size,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
+    RequestFrameOptions, ResizeEdge, Scene, ScrollDelta, ScrollWheelEvent, Size, TouchPhase,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
+    WindowDecorations, WindowParams, point, px, size,
 };
+
+// Keep the raw-event guard aligned with openharmony-ability's 8 vp pan recognizer.
+const TOUCH_TAP_SLOP: f32 = 8.0;
 
 pub(crate) struct OhosWindow {
     app: Rc<RefCell<Option<OpenHarmonyApp>>>,
@@ -39,6 +44,7 @@ pub(crate) struct OhosWindow {
     foreground_executor: ForegroundExecutor,
     keyboard_visible: Rc<Cell<bool>>,
     pointer_position: Cell<Option<Point<Pixels>>>,
+    native_gesture_state: Cell<NativeGestureState>,
 }
 
 pub(crate) struct OhosWindowHandle {
@@ -78,6 +84,57 @@ struct WindowCallbacks {
     close: Option<Box<dyn FnOnce()>>,
     appearance_changed: Option<Box<dyn FnMut()>>,
     hit_test_window_control: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct NativeGestureState {
+    pointer_start: Option<Point<Pixels>>,
+    touch_sequence: bool,
+    tap_suppressed: bool,
+    tap_dispatched: bool,
+}
+
+impl NativeGestureState {
+    fn begin_pointer_sequence(&mut self, position: Point<Pixels>, touch_sequence: bool) {
+        *self = Self {
+            pointer_start: Some(position),
+            touch_sequence,
+            ..Self::default()
+        };
+    }
+
+    fn update_pointer(&mut self, position: Point<Pixels>, pointer_count: u32) {
+        if pointer_count > 1 {
+            self.tap_suppressed = true;
+        }
+
+        let Some(start_position) = self.pointer_start else {
+            return;
+        };
+        let delta = position - start_position;
+        let distance_squared =
+            delta.x.as_f32() * delta.x.as_f32() + delta.y.as_f32() * delta.y.as_f32();
+        if distance_squared > TOUCH_TAP_SLOP * TOUCH_TAP_SLOP {
+            self.tap_suppressed = true;
+        }
+    }
+
+    fn suppress_tap(&mut self) {
+        self.tap_suppressed = true;
+    }
+
+    fn recognize_pan(&mut self) {
+        self.suppress_tap();
+    }
+
+    fn take_tap(&mut self) -> bool {
+        if self.tap_suppressed || self.tap_dispatched {
+            return false;
+        }
+
+        self.tap_dispatched = true;
+        true
+    }
 }
 
 impl OhosWindow {
@@ -124,6 +181,7 @@ impl OhosWindow {
             foreground_executor,
             keyboard_visible: Rc::new(Cell::new(false)),
             pointer_position: Cell::new(None),
+            native_gesture_state: Cell::new(NativeGestureState::default()),
         })
     }
 
@@ -140,10 +198,18 @@ impl OhosWindow {
         result
     }
 
-    fn dispatch_tap(&self) {
+    fn dispatch_native_tap(&self) {
         let Some(position) = self.pointer_position.get() else {
             return;
         };
+
+        let mut gesture_state = self.native_gesture_state.get();
+        let should_dispatch = gesture_state.take_tap();
+        self.native_gesture_state.set(gesture_state);
+        if !should_dispatch {
+            return;
+        }
+
         let modifiers = Modifiers::default();
         self.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
             button: MouseButton::Left,
@@ -158,6 +224,39 @@ impl OhosWindow {
             modifiers,
             click_count: 1,
         }));
+        if gesture_state.touch_sequence {
+            self.clear_touch_hover_feedback();
+        }
+    }
+
+    fn begin_pointer_sequence(&self, position: Point<Pixels>, touch_sequence: bool) {
+        let mut gesture_state = self.native_gesture_state.get();
+        gesture_state.begin_pointer_sequence(position, touch_sequence);
+        self.native_gesture_state.set(gesture_state);
+    }
+
+    fn update_pointer_sequence(&self, position: Point<Pixels>, pointer_count: u32) {
+        let mut gesture_state = self.native_gesture_state.get();
+        gesture_state.update_pointer(position, pointer_count);
+        self.native_gesture_state.set(gesture_state);
+    }
+
+    fn suppress_native_tap(&self) {
+        let mut gesture_state = self.native_gesture_state.get();
+        gesture_state.suppress_tap();
+        self.native_gesture_state.set(gesture_state);
+    }
+
+    fn recognize_native_pan(&self) -> bool {
+        let mut gesture_state = self.native_gesture_state.get();
+        gesture_state.recognize_pan();
+        self.native_gesture_state.set(gesture_state);
+        gesture_state.touch_sequence
+    }
+
+    fn point_from_device_pixels(&self, x: f32, y: f32) -> Point<Pixels> {
+        let scale = (*self.scale.borrow()).max(f32::EPSILON);
+        point(px(x / scale), px(y / scale))
     }
 
     fn dispatch_scroll(&self, delta: Point<Pixels>, touch_phase: TouchPhase) {
@@ -169,6 +268,14 @@ impl OhosWindow {
             delta: ScrollDelta::Pixels(delta),
             modifiers: Modifiers::default(),
             touch_phase,
+        }));
+    }
+
+    fn clear_touch_hover_feedback(&self) {
+        self.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
+            position: point(px(-1.0), px(-1.0)),
+            pressed_button: None,
+            modifiers: Modifiers::default(),
         }));
     }
 
@@ -716,37 +823,67 @@ impl OhosWindow {
                     .detach();
             }
             InputEvent::TouchEvent(touch_event) => {
-                let scale = (*self.scale.borrow()).max(f32::EPSILON);
-                self.pointer_position.set(Some(point(
-                    px(touch_event.x / scale),
-                    px(touch_event.y / scale),
-                )));
+                let position = self.point_from_device_pixels(touch_event.x, touch_event.y);
+                self.pointer_position.set(Some(position));
+                match touch_event.event_type {
+                    TouchEvent::Down => {
+                        self.begin_pointer_sequence(position, true);
+                        self.update_pointer_sequence(position, touch_event.num_points);
+                        self.clear_touch_hover_feedback();
+                    }
+                    TouchEvent::Move | TouchEvent::Up => {
+                        self.update_pointer_sequence(position, touch_event.num_points);
+                    }
+                    TouchEvent::Cancel | TouchEvent::Unknown => {
+                        self.suppress_native_tap();
+                        self.clear_touch_hover_feedback();
+                    }
+                }
             }
             InputEvent::MouseEvent(mouse_event) => {
-                let scale = (*self.scale.borrow()).max(f32::EPSILON);
-                self.pointer_position.set(Some(point(
-                    px(mouse_event.x / scale),
-                    px(mouse_event.y / scale),
-                )));
+                let position = self.point_from_device_pixels(mouse_event.x, mouse_event.y);
+                self.pointer_position.set(Some(position));
+                if mouse_event.action == MouseAction::Press {
+                    self.begin_pointer_sequence(position, false);
+                } else {
+                    self.update_pointer_sequence(position, 1);
+                }
             }
             InputEvent::AxisEvent(axis_event) => {
-                let delta = point(px(axis_event.delta_x as f32), px(axis_event.delta_y as f32));
-                if delta.x != px(0.0) || delta.y != px(0.0) {
-                    self.dispatch_scroll(delta, TouchPhase::Moved);
+                let raw_delta = point(axis_event.delta_x as f32, axis_event.delta_y as f32);
+                let delta = if axis_event.tool_type == UIInputToolType::Touchpad {
+                    self.point_from_device_pixels(raw_delta.x, raw_delta.y)
+                } else {
+                    raw_delta.map(px)
+                };
+                let touch_phase = match axis_event.action {
+                    UIInputAction::Down => TouchPhase::Started,
+                    UIInputAction::Up | UIInputAction::Cancel => TouchPhase::Ended,
+                    UIInputAction::Move => TouchPhase::Moved,
+                };
+                if delta.x != px(0.0)
+                    || delta.y != px(0.0)
+                    || matches!(touch_phase, TouchPhase::Started | TouchPhase::Ended)
+                {
+                    self.dispatch_scroll(delta, touch_phase);
                 }
             }
             InputEvent::GestureEvent(gesture_event) => match gesture_event {
-                GestureEvent::Tap => self.dispatch_tap(),
+                GestureEvent::Tap => self.dispatch_native_tap(),
                 GestureEvent::Pan(pan_event) => {
+                    let touch_sequence = self.recognize_native_pan();
                     let touch_phase = match pan_event.phase {
                         GesturePhase::Start => TouchPhase::Started,
                         GesturePhase::Update => TouchPhase::Moved,
                         GesturePhase::End | GesturePhase::Cancel => TouchPhase::Ended,
                     };
                     self.dispatch_scroll(
-                        point(px(pan_event.delta_x), px(pan_event.delta_y)),
+                        self.point_from_device_pixels(pan_event.delta_x, pan_event.delta_y),
                         touch_phase,
                     );
+                    if touch_sequence {
+                        self.clear_touch_hover_feedback();
+                    }
                 }
                 GestureEvent::Swipe(..) => {}
             },
@@ -1255,5 +1392,66 @@ impl PlatformWindow for OhosWindow {
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
         // There is no such thing on Windows.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NativeGestureState;
+    use crate::{point, px};
+
+    fn position(x: f32, y: f32) -> crate::Point<crate::Pixels> {
+        point(px(x), px(y))
+    }
+
+    #[test]
+    fn pan_recognition_suppresses_parallel_tap() {
+        let mut state = NativeGestureState::default();
+        state.begin_pointer_sequence(position(10.0, 10.0), true);
+        state.recognize_pan();
+
+        assert!(!state.take_tap());
+
+        state.begin_pointer_sequence(position(10.0, 10.0), true);
+        assert!(state.take_tap());
+    }
+
+    #[test]
+    fn duplicate_tap_is_suppressed_within_pointer_sequence() {
+        let mut state = NativeGestureState::default();
+        state.begin_pointer_sequence(position(10.0, 10.0), true);
+
+        assert!(state.take_tap());
+        assert!(!state.take_tap());
+
+        state.begin_pointer_sequence(position(10.0, 10.0), true);
+        assert!(state.take_tap());
+    }
+
+    #[test]
+    fn raw_touch_movement_suppresses_tap_before_pan_callback() {
+        let mut state = NativeGestureState::default();
+        state.begin_pointer_sequence(position(10.0, 10.0), true);
+        state.update_pointer(position(19.0, 10.0), 1);
+
+        assert!(!state.take_tap());
+    }
+
+    #[test]
+    fn raw_touch_jitter_remains_a_tap() {
+        let mut state = NativeGestureState::default();
+        state.begin_pointer_sequence(position(10.0, 10.0), true);
+        state.update_pointer(position(14.0, 14.0), 1);
+
+        assert!(state.take_tap());
+    }
+
+    #[test]
+    fn multiple_touch_points_suppress_tap() {
+        let mut state = NativeGestureState::default();
+        state.begin_pointer_sequence(position(10.0, 10.0), true);
+        state.update_pointer(position(10.0, 10.0), 2);
+
+        assert!(!state.take_tap());
     }
 }
