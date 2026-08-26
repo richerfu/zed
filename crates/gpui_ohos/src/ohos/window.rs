@@ -787,7 +787,7 @@ impl OhosWindow {
                 let mut callback = self.callbacks.borrow_mut().request_frame.take();
                 if let Some(ref mut cb) = callback {
                     cb(RequestFrameOptions {
-                        require_presentation: true,
+                        require_presentation: false,
                         force_render: false,
                     });
                 } else {
