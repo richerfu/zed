@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::Result;
 use futures::channel::oneshot;
-use openharmony_ability::{Event, OpenHarmonyApp};
+use openharmony_ability::{Event, OpenHarmonyApp, TouchInputDelivery};
 use openharmony_ability_plugin_app_control::{
     AppControlBridgePlugin, TerminateRequest, TerminateResponse,
 };
@@ -73,6 +73,9 @@ impl OhosPlatform {
     }
 
     pub(crate) fn set_app(&self, app: OpenHarmonyApp) {
+        if let Err(error) = app.set_touch_input_delivery(TouchInputDelivery::ArkUiGestures) {
+            warn!("Failed to configure ArkUI gesture input for GPUI: {error}");
+        }
         if let Err(error) = app.register_plugin(AppControlBridgePlugin) {
             warn!("Failed to register OpenHarmony app-control plugin: {error}");
         }

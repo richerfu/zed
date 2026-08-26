@@ -5,14 +5,16 @@ use std::{
     cell::{Cell, RefCell},
     rc::Rc,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Result;
 use futures::channel::oneshot;
 use openharmony_ability::{
-    AvoidAreaType, Event, GestureEvent, GesturePhase, ImeEvent, InputEvent, OpenHarmonyApp,
-    arkui::arkui_input_binding::{UIInputAction, UIInputToolType},
-    xcomponent::{MouseAction, TouchEvent},
+    ArkUiInputEvent, AvoidAreaType, Event, GestureEvent, GesturePhase, ImeEvent, InputEvent,
+    OpenHarmonyApp, PointerInputData, XComponentInputEvent,
+    arkui::arkui_input_binding::{UIInputAction, UIInputSourceType, UIInputToolType},
+    xcomponent::{MouseAction, MouseButton as OhosMouseButton},
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
@@ -21,15 +23,20 @@ use super::wgpu_context::WgpuContext;
 use super::wgpu_renderer::{WgpuRenderer, WgpuSurfaceConfig};
 use crate::{
     Bounds, Capslock, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RequestFrameOptions, ResizeEdge, Scene, ScrollDelta, ScrollWheelEvent, Size, TouchPhase,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
-    WindowDecorations, WindowParams, point, px, size,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
+    PromptLevel, RequestFrameOptions, ResizeEdge, Scene, ScrollDelta, ScrollWheelEvent, Size,
+    TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowControls, WindowDecorations, WindowParams, point, px, size,
 };
 
-// Keep the raw-event guard aligned with openharmony-ability's 8 vp pan recognizer.
-const TOUCH_TAP_SLOP: f32 = 8.0;
+const MIN_MOMENTUM_VELOCITY: f32 = 240.0;
+const MAX_MOMENTUM_VELOCITY: f32 = 9_000.0;
+const MOMENTUM_FRICTION: f32 = 4.2;
+const DEFAULT_FRAME_INTERVAL_SECONDS: f32 = 1.0 / 120.0;
+const MIN_FRAME_INTERVAL_SECONDS: f32 = 1.0 / 240.0;
+const MAX_FRAME_INTERVAL_SECONDS: f32 = 0.05;
+const MIN_SCROLL_DELTA: Pixels = px(0.1);
 
 pub(crate) struct OhosWindow {
     app: Rc<RefCell<Option<OpenHarmonyApp>>>,
@@ -44,7 +51,9 @@ pub(crate) struct OhosWindow {
     foreground_executor: ForegroundExecutor,
     keyboard_visible: Rc<Cell<bool>>,
     pointer_position: Cell<Option<Point<Pixels>>>,
-    native_gesture_state: Cell<NativeGestureState>,
+    pressed_mouse_button: Cell<Option<MouseButton>>,
+    scroll_animation: RefCell<Option<ScrollAnimation>>,
+    scroll_frame_rate_boosted: Cell<bool>,
 }
 
 pub(crate) struct OhosWindowHandle {
@@ -86,55 +95,13 @@ struct WindowCallbacks {
     hit_test_window_control: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
 }
 
-#[derive(Clone, Copy, Default)]
-struct NativeGestureState {
-    pointer_start: Option<Point<Pixels>>,
-    touch_sequence: bool,
-    tap_suppressed: bool,
-    tap_dispatched: bool,
-}
-
-impl NativeGestureState {
-    fn begin_pointer_sequence(&mut self, position: Point<Pixels>, touch_sequence: bool) {
-        *self = Self {
-            pointer_start: Some(position),
-            touch_sequence,
-            ..Self::default()
-        };
-    }
-
-    fn update_pointer(&mut self, position: Point<Pixels>, pointer_count: u32) {
-        if pointer_count > 1 {
-            self.tap_suppressed = true;
-        }
-
-        let Some(start_position) = self.pointer_start else {
-            return;
-        };
-        let delta = position - start_position;
-        let distance_squared =
-            delta.x.as_f32() * delta.x.as_f32() + delta.y.as_f32() * delta.y.as_f32();
-        if distance_squared > TOUCH_TAP_SLOP * TOUCH_TAP_SLOP {
-            self.tap_suppressed = true;
-        }
-    }
-
-    fn suppress_tap(&mut self) {
-        self.tap_suppressed = true;
-    }
-
-    fn recognize_pan(&mut self) {
-        self.suppress_tap();
-    }
-
-    fn take_tap(&mut self) -> bool {
-        if self.tap_suppressed || self.tap_dispatched {
-            return false;
-        }
-
-        self.tap_dispatched = true;
-        true
-    }
+#[derive(Clone, Copy)]
+struct ScrollAnimation {
+    position: Point<Pixels>,
+    initial_velocity: Point<f32>,
+    elapsed: f32,
+    last_distance: Point<Pixels>,
+    last_frame_timestamp: Option<Duration>,
 }
 
 impl OhosWindow {
@@ -181,7 +148,9 @@ impl OhosWindow {
             foreground_executor,
             keyboard_visible: Rc::new(Cell::new(false)),
             pointer_position: Cell::new(None),
-            native_gesture_state: Cell::new(NativeGestureState::default()),
+            pressed_mouse_button: Cell::new(None),
+            scroll_animation: RefCell::new(None),
+            scroll_frame_rate_boosted: Cell::new(false),
         })
     }
 
@@ -198,15 +167,14 @@ impl OhosWindow {
         result
     }
 
-    fn dispatch_native_tap(&self) {
-        let Some(position) = self.pointer_position.get() else {
+    fn dispatch_native_tap(&self, pointer: PointerInputData) {
+        if !Self::is_touch_pointer(pointer) || pointer.pointer_count > 1 {
             return;
-        };
-
-        let mut gesture_state = self.native_gesture_state.get();
-        let should_dispatch = gesture_state.take_tap();
-        self.native_gesture_state.set(gesture_state);
-        if !should_dispatch {
+        }
+        let position = self.pointer_position_from_arkui(pointer);
+        self.pointer_position.set(Some(position));
+        if self.stop_momentum() {
+            self.clear_touch_hover_feedback();
             return;
         }
 
@@ -224,34 +192,7 @@ impl OhosWindow {
             modifiers,
             click_count: 1,
         }));
-        if gesture_state.touch_sequence {
-            self.clear_touch_hover_feedback();
-        }
-    }
-
-    fn begin_pointer_sequence(&self, position: Point<Pixels>, touch_sequence: bool) {
-        let mut gesture_state = self.native_gesture_state.get();
-        gesture_state.begin_pointer_sequence(position, touch_sequence);
-        self.native_gesture_state.set(gesture_state);
-    }
-
-    fn update_pointer_sequence(&self, position: Point<Pixels>, pointer_count: u32) {
-        let mut gesture_state = self.native_gesture_state.get();
-        gesture_state.update_pointer(position, pointer_count);
-        self.native_gesture_state.set(gesture_state);
-    }
-
-    fn suppress_native_tap(&self) {
-        let mut gesture_state = self.native_gesture_state.get();
-        gesture_state.suppress_tap();
-        self.native_gesture_state.set(gesture_state);
-    }
-
-    fn recognize_native_pan(&self) -> bool {
-        let mut gesture_state = self.native_gesture_state.get();
-        gesture_state.recognize_pan();
-        self.native_gesture_state.set(gesture_state);
-        gesture_state.touch_sequence
+        self.clear_touch_hover_feedback();
     }
 
     fn point_from_device_pixels(&self, x: f32, y: f32) -> Point<Pixels> {
@@ -259,16 +200,177 @@ impl OhosWindow {
         point(px(x / scale), px(y / scale))
     }
 
-    fn dispatch_scroll(&self, delta: Point<Pixels>, touch_phase: TouchPhase) {
-        let Some(position) = self.pointer_position.get() else {
+    fn velocity_from_device_pixels(&self, x: f32, y: f32) -> Point<f32> {
+        let scale = (*self.scale.borrow()).max(f32::EPSILON);
+        point(x / scale, y / scale)
+    }
+
+    fn pointer_position_from_arkui(&self, pointer: PointerInputData) -> Point<Pixels> {
+        self.point_from_device_pixels(pointer.x, pointer.y)
+    }
+
+    fn is_touch_pointer(pointer: PointerInputData) -> bool {
+        pointer.source_type == UIInputSourceType::TouchScreen
+            || matches!(
+                pointer.tool_type,
+                UIInputToolType::Finger | UIInputToolType::Pen
+            )
+    }
+
+    fn dispatch_scroll(
+        &self,
+        position: Point<Pixels>,
+        delta: Point<Pixels>,
+        touch_phase: TouchPhase,
+    ) -> crate::DispatchEventResult {
+        Self::dispatch_input_with_callbacks(
+            &self.callbacks,
+            PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(delta),
+                modifiers: Modifiers::default(),
+                touch_phase,
+            }),
+        )
+    }
+
+    fn mouse_button(button: OhosMouseButton) -> Option<MouseButton> {
+        match button {
+            OhosMouseButton::NoneButton => None,
+            OhosMouseButton::LeftButton => Some(MouseButton::Left),
+            OhosMouseButton::RightButton => Some(MouseButton::Right),
+            OhosMouseButton::MiddleButton => Some(MouseButton::Middle),
+            OhosMouseButton::BackButton => Some(MouseButton::Navigate(NavigationDirection::Back)),
+            OhosMouseButton::ForwardButton => {
+                Some(MouseButton::Navigate(NavigationDirection::Forward))
+            }
+        }
+    }
+
+    fn set_scroll_frame_rate_boost(&self, boosted: bool) {
+        if self.scroll_frame_rate_boosted.replace(boosted) == boosted {
+            return;
+        }
+        if let Some(app) = self.app.borrow().as_ref() {
+            if boosted {
+                app.set_frame_rate(60, 120, 120);
+            } else {
+                app.set_frame_rate(30, 120, 60);
+            }
+        }
+    }
+
+    fn scroll_frame_timestamp(timestamp: i64) -> Option<Duration> {
+        u64::try_from(timestamp).ok().map(Duration::from_nanos)
+    }
+
+    fn animation_frame_interval(
+        animation: &mut ScrollAnimation,
+        frame_timestamp: Option<Duration>,
+    ) -> f32 {
+        let Some(frame_timestamp) = frame_timestamp else {
+            return DEFAULT_FRAME_INTERVAL_SECONDS;
+        };
+        let elapsed = animation
+            .last_frame_timestamp
+            .and_then(|previous| frame_timestamp.checked_sub(previous))
+            .map(|elapsed| elapsed.as_secs_f32())
+            .filter(|elapsed| *elapsed > 0.0)
+            .unwrap_or(DEFAULT_FRAME_INTERVAL_SECONDS);
+        animation.last_frame_timestamp = Some(frame_timestamp);
+        elapsed.clamp(MIN_FRAME_INTERVAL_SECONDS, MAX_FRAME_INTERVAL_SECONDS)
+    }
+
+    fn scroll_animation_distance(velocity: Point<f32>, elapsed: f32) -> Point<Pixels> {
+        let coefficient = (1.0 - (-MOMENTUM_FRICTION * elapsed).exp()) / MOMENTUM_FRICTION;
+        point(px(velocity.x * coefficient), px(velocity.y * coefficient))
+    }
+
+    fn scroll_animation_velocity(velocity: Point<f32>, elapsed: f32) -> Point<f32> {
+        let decay = (-MOMENTUM_FRICTION * elapsed).exp();
+        point(velocity.x * decay, velocity.y * decay)
+    }
+
+    fn clamp_momentum_velocity(velocity: Point<f32>) -> Point<f32> {
+        point(
+            velocity
+                .x
+                .clamp(-MAX_MOMENTUM_VELOCITY, MAX_MOMENTUM_VELOCITY),
+            velocity
+                .y
+                .clamp(-MAX_MOMENTUM_VELOCITY, MAX_MOMENTUM_VELOCITY),
+        )
+    }
+
+    fn velocity_magnitude(velocity: Point<f32>) -> f32 {
+        velocity.x.hypot(velocity.y)
+    }
+
+    fn start_momentum(&self, position: Point<Pixels>, velocity: Point<f32>) {
+        let velocity = Self::clamp_momentum_velocity(velocity);
+        if Self::velocity_magnitude(velocity) < MIN_MOMENTUM_VELOCITY {
+            self.dispatch_scroll_end(position);
+            return;
+        }
+        self.set_scroll_frame_rate_boost(true);
+        *self.scroll_animation.borrow_mut() = Some(ScrollAnimation {
+            position,
+            initial_velocity: velocity,
+            elapsed: 0.0,
+            last_distance: point(px(0.0), px(0.0)),
+            last_frame_timestamp: None,
+        });
+    }
+
+    fn advance_scroll_animation(&self, frame_timestamp: Option<Duration>) {
+        let Some(mut animation) = self.scroll_animation.borrow_mut().take() else {
             return;
         };
-        self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-            position,
-            delta: ScrollDelta::Pixels(delta),
-            modifiers: Modifiers::default(),
-            touch_phase,
-        }));
+        let frame_interval = Self::animation_frame_interval(&mut animation, frame_timestamp);
+        animation.elapsed += frame_interval;
+        let distance =
+            Self::scroll_animation_distance(animation.initial_velocity, animation.elapsed);
+        let delta = point(
+            distance.x - animation.last_distance.x,
+            distance.y - animation.last_distance.y,
+        );
+        animation.last_distance = distance;
+        let velocity =
+            Self::scroll_animation_velocity(animation.initial_velocity, animation.elapsed);
+        if Self::velocity_magnitude(velocity) < MIN_MOMENTUM_VELOCITY
+            || (delta.x.abs() < MIN_SCROLL_DELTA && delta.y.abs() < MIN_SCROLL_DELTA)
+        {
+            self.dispatch_scroll_end(animation.position);
+            return;
+        }
+        let result = self.dispatch_scroll(animation.position, delta, TouchPhase::Moved);
+        self.clear_touch_hover_feedback();
+        if result.propagate {
+            self.dispatch_scroll_end(animation.position);
+        } else {
+            *self.scroll_animation.borrow_mut() = Some(animation);
+        }
+    }
+
+    fn dispatch_scroll_end(&self, position: Point<Pixels>) {
+        self.scroll_animation.borrow_mut().take();
+        self.set_scroll_frame_rate_boost(false);
+        self.dispatch_scroll(position, point(px(0.0), px(0.0)), TouchPhase::Ended);
+        self.clear_touch_hover_feedback();
+    }
+
+    fn stop_momentum(&self) -> bool {
+        let position = self
+            .scroll_animation
+            .borrow_mut()
+            .take()
+            .map(|animation| animation.position);
+        let Some(position) = position else {
+            return false;
+        };
+        self.set_scroll_frame_rate_boost(false);
+        self.dispatch_scroll(position, point(px(0.0), px(0.0)), TouchPhase::Ended);
+        true
     }
 
     fn clear_touch_hover_feedback(&self) {
@@ -674,7 +776,11 @@ impl OhosWindow {
                     self.emit_resize_callback();
                 }
             }
-            Event::WindowRedraw(..) => {
+            Event::WindowRedraw(info) => {
+                self.advance_scroll_animation(
+                    Self::scroll_frame_timestamp(info.target_time_stamp)
+                        .or_else(|| Self::scroll_frame_timestamp(info.time_stamp)),
+                );
                 // Take the callback out to avoid holding borrow during execution
                 // This is critical because the callback will eventually call window.draw()
                 // which may access other parts of OhosWindow
@@ -701,6 +807,7 @@ impl OhosWindow {
                 self.callbacks.borrow_mut().active_status_change = callback;
             }
             Event::LostFocus => {
+                self.stop_momentum();
                 let mut callback = self.callbacks.borrow_mut().active_status_change.take();
                 if let Some(ref mut cb) = callback {
                     cb(false);
@@ -723,6 +830,7 @@ impl OhosWindow {
                 self.emit_resize_callback();
             }
             Event::WindowDestroy => {
+                self.stop_momentum();
                 if self.refresh_keyboard_overlap_device_px() {
                     self.emit_resize_callback();
                 }
@@ -758,7 +866,7 @@ impl OhosWindow {
 
     fn handle_input_event(&self, event: &InputEvent) {
         match event {
-            InputEvent::ImeEvent(ime_event) => {
+            InputEvent::Ime(ime_event) => {
                 if matches!(
                     ime_event,
                     ImeEvent::ImeStatusEvent(openharmony_ability::ime::KeyboardStatus::Hide)
@@ -822,41 +930,58 @@ impl OhosWindow {
                     })
                     .detach();
             }
-            InputEvent::TouchEvent(touch_event) => {
-                let position = self.point_from_device_pixels(touch_event.x, touch_event.y);
-                self.pointer_position.set(Some(position));
-                match touch_event.event_type {
-                    TouchEvent::Down => {
-                        self.begin_pointer_sequence(position, true);
-                        self.update_pointer_sequence(position, touch_event.num_points);
-                        self.clear_touch_hover_feedback();
-                    }
-                    TouchEvent::Move | TouchEvent::Up => {
-                        self.update_pointer_sequence(position, touch_event.num_points);
-                    }
-                    TouchEvent::Cancel | TouchEvent::Unknown => {
-                        self.suppress_native_tap();
-                        self.clear_touch_hover_feedback();
-                    }
-                }
-            }
-            InputEvent::MouseEvent(mouse_event) => {
+            InputEvent::XComponent(XComponentInputEvent::Mouse(mouse_event)) => {
                 let position = self.point_from_device_pixels(mouse_event.x, mouse_event.y);
                 self.pointer_position.set(Some(position));
-                if mouse_event.action == MouseAction::Press {
-                    self.begin_pointer_sequence(position, false);
-                } else {
-                    self.update_pointer_sequence(position, 1);
+                let event_button = Self::mouse_button(mouse_event.button);
+                match mouse_event.action {
+                    MouseAction::Press => {
+                        let Some(button) = event_button else {
+                            return;
+                        };
+                        self.pressed_mouse_button.set(Some(button));
+                        self.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
+                            button,
+                            position,
+                            modifiers: Modifiers::default(),
+                            click_count: 1,
+                            first_mouse: false,
+                        }));
+                    }
+                    MouseAction::Release => {
+                        let button = event_button.or(self.pressed_mouse_button.get());
+                        self.pressed_mouse_button.set(None);
+                        let Some(button) = button else {
+                            return;
+                        };
+                        self.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                            button,
+                            position,
+                            modifiers: Modifiers::default(),
+                            click_count: 1,
+                        }));
+                    }
+                    MouseAction::Move => {
+                        self.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
+                            position,
+                            pressed_button: self.pressed_mouse_button.get().or(event_button),
+                            modifiers: Modifiers::default(),
+                        }));
+                    }
+                    MouseAction::None => {}
                 }
             }
-            InputEvent::AxisEvent(axis_event) => {
+            InputEvent::ArkUi(ArkUiInputEvent::Axis(axis_event)) => {
+                self.stop_momentum();
+                let position = self.pointer_position_from_arkui(axis_event.pointer);
+                self.pointer_position.set(Some(position));
                 let raw_delta = point(axis_event.delta_x as f32, axis_event.delta_y as f32);
-                let delta = if axis_event.tool_type == UIInputToolType::Touchpad {
+                let delta = if axis_event.pointer.tool_type == UIInputToolType::Touchpad {
                     self.point_from_device_pixels(raw_delta.x, raw_delta.y)
                 } else {
                     raw_delta.map(px)
                 };
-                let touch_phase = match axis_event.action {
+                let touch_phase = match axis_event.pointer.action {
                     UIInputAction::Down => TouchPhase::Started,
                     UIInputAction::Up | UIInputAction::Cancel => TouchPhase::Ended,
                     UIInputAction::Move => TouchPhase::Moved,
@@ -865,29 +990,53 @@ impl OhosWindow {
                     || delta.y != px(0.0)
                     || matches!(touch_phase, TouchPhase::Started | TouchPhase::Ended)
                 {
-                    self.dispatch_scroll(delta, touch_phase);
+                    self.dispatch_scroll(position, delta, touch_phase);
                 }
             }
-            InputEvent::GestureEvent(gesture_event) => match gesture_event {
-                GestureEvent::Tap => self.dispatch_native_tap(),
+            InputEvent::ArkUi(ArkUiInputEvent::Gesture(gesture_event)) => match gesture_event {
+                GestureEvent::Tap(tap_event) => self.dispatch_native_tap(tap_event.pointer),
                 GestureEvent::Pan(pan_event) => {
-                    let touch_sequence = self.recognize_native_pan();
-                    let touch_phase = match pan_event.phase {
-                        GesturePhase::Start => TouchPhase::Started,
-                        GesturePhase::Update => TouchPhase::Moved,
-                        GesturePhase::End | GesturePhase::Cancel => TouchPhase::Ended,
-                    };
-                    self.dispatch_scroll(
-                        self.point_from_device_pixels(pan_event.delta_x, pan_event.delta_y),
-                        touch_phase,
-                    );
-                    if touch_sequence {
-                        self.clear_touch_hover_feedback();
+                    if !Self::is_touch_pointer(pan_event.pointer) {
+                        return;
                     }
+                    let position = self.pointer_position_from_arkui(pan_event.pointer);
+                    self.pointer_position.set(Some(position));
+                    if pan_event.pointer.pointer_count > 1 {
+                        self.dispatch_scroll_end(position);
+                        return;
+                    }
+                    let delta = self.point_from_device_pixels(pan_event.delta_x, pan_event.delta_y);
+                    match pan_event.phase {
+                        GesturePhase::Start => {
+                            self.stop_momentum();
+                            self.dispatch_scroll(position, delta, TouchPhase::Started);
+                        }
+                        GesturePhase::Update => {
+                            self.dispatch_scroll(position, delta, TouchPhase::Moved);
+                        }
+                        GesturePhase::End => {
+                            if delta.x != px(0.0) || delta.y != px(0.0) {
+                                self.dispatch_scroll(position, delta, TouchPhase::Moved);
+                            }
+                            self.start_momentum(
+                                position,
+                                self.velocity_from_device_pixels(
+                                    pan_event.velocity_x,
+                                    pan_event.velocity_y,
+                                ),
+                            );
+                        }
+                        GesturePhase::Cancel => {
+                            self.dispatch_scroll_end(position);
+                        }
+                    }
+                    self.clear_touch_hover_feedback();
                 }
                 GestureEvent::Swipe(..) => {}
             },
-            InputEvent::KeyEvent(..) => {}
+            InputEvent::XComponent(
+                XComponentInputEvent::Key(_) | XComponentInputEvent::Touch(_),
+            ) => {}
         }
     }
 
@@ -1397,61 +1546,67 @@ impl PlatformWindow for OhosWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::NativeGestureState;
-    use crate::{point, px};
+    use openharmony_ability::arkui::arkui_input_binding::{
+        UIInputAction, UIInputEvent, UIInputSourceType, UIInputToolType,
+    };
 
-    fn position(x: f32, y: f32) -> crate::Point<crate::Pixels> {
-        point(px(x), px(y))
+    use super::OhosWindow;
+    use crate::point;
+
+    #[test]
+    fn momentum_distance_increases_and_velocity_decays() {
+        let velocity = point(1_000.0, -500.0);
+        let early_distance = OhosWindow::scroll_animation_distance(velocity, 0.1);
+        let late_distance = OhosWindow::scroll_animation_distance(velocity, 0.5);
+        let early_velocity = OhosWindow::scroll_animation_velocity(velocity, 0.1);
+        let late_velocity = OhosWindow::scroll_animation_velocity(velocity, 0.5);
+
+        assert!(late_distance.x > early_distance.x);
+        assert!(late_distance.y < early_distance.y);
+        assert!(late_velocity.x.abs() < early_velocity.x.abs());
+        assert!(late_velocity.y.abs() < early_velocity.y.abs());
     }
 
     #[test]
-    fn pan_recognition_suppresses_parallel_tap() {
-        let mut state = NativeGestureState::default();
-        state.begin_pointer_sequence(position(10.0, 10.0), true);
-        state.recognize_pan();
-
-        assert!(!state.take_tap());
-
-        state.begin_pointer_sequence(position(10.0, 10.0), true);
-        assert!(state.take_tap());
+    fn momentum_velocity_is_clamped_per_axis() {
+        let velocity = OhosWindow::clamp_momentum_velocity(point(20_000.0, -20_000.0));
+        assert_eq!(velocity, point(9_000.0, -9_000.0));
     }
 
     #[test]
-    fn duplicate_tap_is_suppressed_within_pointer_sequence() {
-        let mut state = NativeGestureState::default();
-        state.begin_pointer_sequence(position(10.0, 10.0), true);
-
-        assert!(state.take_tap());
-        assert!(!state.take_tap());
-
-        state.begin_pointer_sequence(position(10.0, 10.0), true);
-        assert!(state.take_tap());
+    fn arkui_touch_filter_rejects_mouse_gestures() {
+        assert!(OhosWindow::is_touch_pointer(pointer(
+            UIInputSourceType::TouchScreen,
+            UIInputToolType::Finger,
+        )));
+        assert!(OhosWindow::is_touch_pointer(pointer(
+            UIInputSourceType::Unknown,
+            UIInputToolType::Pen,
+        )));
+        assert!(!OhosWindow::is_touch_pointer(pointer(
+            UIInputSourceType::Mouse,
+            UIInputToolType::Mouse,
+        )));
     }
 
-    #[test]
-    fn raw_touch_movement_suppresses_tap_before_pan_callback() {
-        let mut state = NativeGestureState::default();
-        state.begin_pointer_sequence(position(10.0, 10.0), true);
-        state.update_pointer(position(19.0, 10.0), 1);
-
-        assert!(!state.take_tap());
-    }
-
-    #[test]
-    fn raw_touch_jitter_remains_a_tap() {
-        let mut state = NativeGestureState::default();
-        state.begin_pointer_sequence(position(10.0, 10.0), true);
-        state.update_pointer(position(14.0, 14.0), 1);
-
-        assert!(state.take_tap());
-    }
-
-    #[test]
-    fn multiple_touch_points_suppress_tap() {
-        let mut state = NativeGestureState::default();
-        state.begin_pointer_sequence(position(10.0, 10.0), true);
-        state.update_pointer(position(10.0, 10.0), 2);
-
-        assert!(!state.take_tap());
+    fn pointer(
+        source_type: UIInputSourceType,
+        tool_type: UIInputToolType,
+    ) -> openharmony_ability::PointerInputData {
+        openharmony_ability::PointerInputData {
+            event_type: UIInputEvent::Touch,
+            action: UIInputAction::Move,
+            source_type,
+            tool_type,
+            x: 10.0,
+            y: 20.0,
+            window_x: 10.0,
+            window_y: 20.0,
+            display_x: 10.0,
+            display_y: 20.0,
+            timestamp: 42,
+            pointer_count: 1,
+            pointer_id: Some(0),
+        }
     }
 }
