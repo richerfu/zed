@@ -145,7 +145,7 @@ scap = { workspace = true, optional = true }
 windows = { version = "0.61", features = ["Win32_Foundation"] }
 
 [target.'cfg(target_env = "ohos")'.dependencies]
-openharmony-ability = { git = "https://github.com/harmony-contrib/openharmony-ability.git", rev = "3e9bd7f284bd566d538c01099d1ee63a7369dd3d" }
+openharmony-ability = { version = "1.0.0-beta.2" }
 
 
 [dev-dependencies]
