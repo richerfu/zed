@@ -222,7 +222,7 @@ impl Platform for OhosPlatform {
             .detach();
     }
 
-    fn restart(&self, _binary_path: Option<PathBuf>) {
+    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<std::ffi::OsString>) {
         // Not supported on OHOS
     }
 
@@ -368,11 +368,15 @@ impl Platform for OhosPlatform {
         // Not supported on OHOS
     }
 
-    fn on_quit(&self, _callback: Box<dyn FnMut()>) {
+    fn on_quit(&self, _callback: Box<dyn FnMut() -> bool>) {
         // Handled by OpenHarmonyApp lifecycle
     }
 
     fn on_reopen(&self, _callback: Box<dyn FnMut()>) {
+        // Not supported on OHOS
+    }
+
+    fn on_system_wake(&self, _callback: Box<dyn FnMut()>) {
         // Not supported on OHOS
     }
 

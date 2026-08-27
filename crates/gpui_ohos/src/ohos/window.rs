@@ -1261,13 +1261,6 @@ impl PlatformWindow for OhosWindowHandle {
         self.with_window(|window| window.draw(scene))
     }
 
-    fn completed_frame(&self) {
-        if self.input_handler.borrow().is_none() {
-            self.with_window(|window| window.hide_keyboard_if_needed());
-        }
-        self.with_window(|window| window.completed_frame())
-    }
-
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.with_window(|window| window.sprite_atlas())
     }

@@ -6,9 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{
-    PlatformDispatcher, Priority, PriorityQueueSender, RunnableVariant, ThreadTaskTimings,
-};
+use crate::{PlatformDispatcher, Priority, PriorityQueueSender, RunnableVariant};
 use openharmony_ability::OpenHarmonyWaker;
 
 struct TimerAfter {
@@ -119,19 +117,6 @@ impl OhosDispatcher {
 }
 
 impl PlatformDispatcher for OhosDispatcher {
-    fn get_all_timings(&self) -> Vec<ThreadTaskTimings> {
-        Vec::new()
-    }
-
-    fn get_current_thread_timings(&self) -> ThreadTaskTimings {
-        ThreadTaskTimings {
-            thread_name: None,
-            thread_id: thread::current().id(),
-            timings: Vec::new(),
-            total_pushed: 0,
-        }
-    }
-
     fn is_main_thread(&self) -> bool {
         thread::current().id() == self.main_thread_id
     }
