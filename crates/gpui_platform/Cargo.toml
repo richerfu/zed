@@ -28,9 +28,14 @@ gpui_macos.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui_windows.workspace = true
+gpui = { workspace = true, features = ["windows-manifest"] }
 
 [target.'cfg(target_env = "ohos")'.dependencies]
 gpui_ohos.workspace = true
 
 [target.'cfg(all(any(target_os = "linux", target_os = "freebsd"), not(target_env = "ohos")))'.dependencies]
 gpui_linux.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+gpui_web.workspace = true
+console_error_panic_hook = "0.1.7"

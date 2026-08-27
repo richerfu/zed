@@ -122,7 +122,7 @@ impl WgpuRenderer {
             .map_err(|e| anyhow::anyhow!("Failed to get display handle: {e}"))?;
 
         let target = wgpu::SurfaceTargetUnsafe::RawHandle {
-            raw_display_handle: display_handle.as_raw(),
+            raw_display_handle: Some(display_handle.as_raw()),
             raw_window_handle: window_handle.as_raw(),
         };
 
@@ -846,9 +846,14 @@ impl WgpuRenderer {
                                topology: wgpu::PrimitiveTopology,
                                color_targets: &[Option<wgpu::ColorTargetState>],
                                sample_count: u32| {
+            let bind_group_layouts = bind_group_layouts
+                .iter()
+                .copied()
+                .map(Some)
+                .collect::<Vec<_>>();
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{name}_layout")),
-                bind_group_layouts,
+                bind_group_layouts: &bind_group_layouts,
                 immediate_size: 0,
             });
 
@@ -1139,13 +1144,21 @@ impl WgpuRenderer {
         self.atlas.before_frame();
 
         let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                drop(frame);
                 self.surface.configure(&self.device, &self.surface_config);
                 return;
             }
-            Err(e) => {
-                log::error!("Failed to acquire surface texture: {e}");
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                self.surface.configure(&self.device, &self.surface_config);
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                log::error!("Failed to acquire surface texture: validation error");
                 return;
             }
         };

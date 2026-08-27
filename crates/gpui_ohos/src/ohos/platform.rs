@@ -9,7 +9,10 @@ use std::{
 
 use anyhow::Result;
 use futures::channel::oneshot;
-use openharmony_ability::{Event, OpenHarmonyApp};
+use openharmony_ability::{Event, OpenHarmonyApp, TouchInputDelivery};
+use openharmony_ability_plugin_app_control::{
+    AppControlBridgePlugin, TerminateRequest, TerminateResponse,
+};
 
 use crate::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
@@ -70,6 +73,12 @@ impl OhosPlatform {
     }
 
     pub(crate) fn set_app(&self, app: OpenHarmonyApp) {
+        if let Err(error) = app.set_touch_input_delivery(TouchInputDelivery::ArkUiGestures) {
+            warn!("Failed to configure ArkUI gesture input for GPUI: {error}");
+        }
+        if let Err(error) = app.register_plugin(AppControlBridgePlugin) {
+            warn!("Failed to register OpenHarmony app-control plugin: {error}");
+        }
         *self.app.borrow_mut() = Some(app.clone());
         // Initialize primary display when app is set
         *self.primary_display.borrow_mut() = Some(OhosDisplay::new(app.clone()));
@@ -183,9 +192,34 @@ impl Platform for OhosPlatform {
     }
 
     fn quit(&self) {
-        if let Some(app) = self.app.borrow_mut().clone() {
-            app.exit(0);
-        }
+        let Some(app) = self.app.borrow().clone() else {
+            return;
+        };
+
+        self.background_executor
+            .spawn(async move {
+                let result = async {
+                    let response = app
+                        .bridge()?
+                        .call_sync_from_worker::<
+                            AppControlBridgePlugin,
+                            TerminateRequest,
+                            TerminateResponse,
+                        >("terminate", TerminateRequest { code: 0 })
+                        .await?;
+                    anyhow::ensure!(
+                        response.accepted,
+                        "OpenHarmony app-control plugin rejected termination"
+                    );
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await;
+
+                if let Err(error) = result {
+                    warn!("Failed to terminate OpenHarmony application: {error}");
+                }
+            })
+            .detach();
     }
 
     fn restart(&self, _binary_path: Option<PathBuf>) {
@@ -194,6 +228,14 @@ impl Platform for OhosPlatform {
 
     fn activate(&self, _ignoring_other_apps: bool) {
         // Not supported on OHOS
+    }
+
+    fn hide_cursor_until_mouse_moves(&self) {
+        // Not supported on OHOS
+    }
+
+    fn is_cursor_visible(&self) -> bool {
+        true
     }
 
     fn hide(&self) {
