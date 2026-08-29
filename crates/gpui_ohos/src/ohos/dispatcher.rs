@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::BinaryHeap,
+    collections::{BinaryHeap, VecDeque},
     sync::{Arc, Condvar, Mutex},
     thread,
     time::{Duration, Instant},
@@ -39,6 +39,7 @@ pub(crate) struct OhosDispatcher {
     main_thread_id: thread::ThreadId,
     main_sender: PriorityQueueSender<RunnableVariant>,
     timer_queue: Arc<(Mutex<BinaryHeap<TimerAfter>>, Condvar)>,
+    ready_timers: Arc<Mutex<VecDeque<RunnableVariant>>>,
     waker: Arc<Mutex<Option<OpenHarmonyWaker>>>,
     _timer_thread: thread::JoinHandle<()>,
 }
@@ -47,8 +48,10 @@ impl OhosDispatcher {
     pub(crate) fn new(main_sender: PriorityQueueSender<RunnableVariant>) -> Self {
         let timer_queue: Arc<(Mutex<BinaryHeap<TimerAfter>>, Condvar)> =
             Arc::new((Mutex::new(BinaryHeap::new()), Condvar::new()));
+        let ready_timers = Arc::new(Mutex::new(VecDeque::new()));
         let waker: Arc<Mutex<Option<OpenHarmonyWaker>>> = Arc::new(Mutex::new(None));
         let timer_queue_thread = timer_queue.clone();
+        let ready_timers_thread = ready_timers.clone();
         let waker_thread = waker.clone();
         let timer_thread = thread::Builder::new()
             .name("OhosTimer".to_owned())
@@ -71,8 +74,20 @@ impl OhosDispatcher {
                         }
                     }
 
+                    let now = Instant::now();
+                    let mut due = VecDeque::new();
+                    while heap.peek().is_some_and(|next| next.when <= now) {
+                        due.push_back(heap.pop().expect("due timer entry exists").runnable);
+                    }
                     drop(heap);
-                    if let Some(waker) = waker_thread.lock().unwrap().as_ref() {
+
+                    let queued_any = !due.is_empty();
+                    ready_timers_thread.lock().unwrap().append(&mut due);
+
+                    // A timer is removed from the deadline heap before waking the UI thread.
+                    // This guarantees that a delayed or unavailable waker cannot turn an
+                    // expired timer into a busy loop.
+                    if queued_any && let Some(waker) = waker_thread.lock().unwrap().as_ref() {
                         waker.wake();
                     }
                 }
@@ -83,6 +98,7 @@ impl OhosDispatcher {
             main_thread_id: thread::current().id(),
             main_sender,
             timer_queue,
+            ready_timers,
             waker,
             _timer_thread: timer_thread,
         }
@@ -93,19 +109,7 @@ impl OhosDispatcher {
     }
 
     pub(crate) fn run_due_timers(&self) {
-        let mut due = Vec::new();
-        let now = Instant::now();
-        {
-            let (lock, _) = &*self.timer_queue;
-            let mut heap = lock.lock().unwrap();
-            while let Some(next) = heap.peek() {
-                if next.when > now {
-                    break;
-                }
-                due.push(heap.pop().expect("timer entry exists").runnable);
-            }
-        }
-
+        let due = std::mem::take(&mut *self.ready_timers.lock().unwrap());
         for runnable in due {
             runnable.run();
         }

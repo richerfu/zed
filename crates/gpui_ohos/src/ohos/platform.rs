@@ -99,13 +99,19 @@ impl OhosPlatform {
     }
 
     fn handle_ohos_event(&self, event: &Event, on_finish_launching: Option<Box<dyn FnOnce()>>) {
+        // create_waker() snapshots the lifecycle's current ThreadsafeFunction. Refresh it once
+        // the surface exists so timers scheduled during early startup can reliably wake the UI
+        // thread even if the first snapshot was taken before lifecycle initialization finished.
+        if matches!(event, Event::SurfaceCreate)
+            && let Some(app) = self.app.borrow().as_ref()
+        {
+            self.dispatcher.set_waker(app.create_waker());
+        }
+
         // First, process any GPUI tasks queued for the main thread
         // This ensures tasks are processed in the run_loop, integrating GPUI with OpenHarmony's event loop
         self.run_foreground_tasks();
-
-        if matches!(event, Event::UserEvent) {
-            self.dispatcher.run_due_timers();
-        }
+        self.dispatcher.run_due_timers();
 
         // Handle on_finish_launching callback first, before routing to windows.
         // This is critical because windows are created INSIDE the on_finish_launching callback,
