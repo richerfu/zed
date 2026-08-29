@@ -30,20 +30,29 @@ struct PendingUpload {
 struct WgpuAtlasState {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
+    texture_bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
     storage: WgpuAtlasStorage,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     pending_uploads: Vec<PendingUpload>,
 }
 
 pub struct WgpuTextureInfo {
-    pub view: wgpu::TextureView,
+    pub bind_group: wgpu::BindGroup,
 }
 
 impl WgpuAtlas {
-    pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Self {
+    pub fn new(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        texture_bind_group_layout: wgpu::BindGroupLayout,
+        sampler: wgpu::Sampler,
+    ) -> Self {
         WgpuAtlas(Mutex::new(WgpuAtlasState {
             device,
             queue,
+            texture_bind_group_layout,
+            sampler,
             storage: WgpuAtlasStorage::default(),
             tiles_by_key: Default::default(),
             pending_uploads: Vec::new(),
@@ -59,7 +68,7 @@ impl WgpuAtlas {
         let lock = self.0.lock();
         let texture = &lock.storage[id];
         WgpuTextureInfo {
-            view: texture.view.clone(),
+            bind_group: texture.bind_group.clone(),
         }
     }
 }
@@ -162,6 +171,20 @@ impl WgpuAtlasState {
         });
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("atlas_texture_bind_group"),
+            layout: &self.texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
 
         let texture_list = &mut self.storage[kind];
         let index = texture_list.free_list.pop();
@@ -174,7 +197,7 @@ impl WgpuAtlasState {
             allocator: BucketedAtlasAllocator::new(device_size_to_etagere(size)),
             format,
             texture,
-            view,
+            bind_group,
             live_atlas_keys: 0,
         };
 
@@ -281,7 +304,7 @@ struct WgpuAtlasTexture {
     id: AtlasTextureId,
     allocator: BucketedAtlasAllocator,
     texture: wgpu::Texture,
-    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
     format: wgpu::TextureFormat,
     live_atlas_keys: u32,
 }
