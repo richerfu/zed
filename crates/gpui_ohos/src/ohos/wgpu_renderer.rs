@@ -113,6 +113,7 @@ pub struct WgpuRenderer {
     instance_buffer: wgpu::Buffer,
     instance_buffer_capacity: u64,
     instance_buffer_alignment: u64,
+    instance_upload: RefCell<Vec<u8>>,
     path_intermediate_texture: wgpu::Texture,
     path_intermediate_view: wgpu::TextureView,
     path_msaa_texture: Option<wgpu::Texture>,
@@ -358,6 +359,9 @@ impl WgpuRenderer {
             instance_buffer,
             instance_buffer_capacity: initial_instance_buffer_capacity,
             instance_buffer_alignment,
+            instance_upload: RefCell::new(Vec::with_capacity(
+                initial_instance_buffer_capacity as usize,
+            )),
             path_intermediate_texture,
             path_intermediate_view,
             path_msaa_texture,
@@ -1276,6 +1280,7 @@ impl WgpuRenderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         loop {
+            self.instance_upload.borrow_mut().clear();
             let mut instance_offset: u64 = 0;
             let Some(instance_bindings) = self.write_scene_instances(scene, &mut instance_offset)
             else {
@@ -1421,6 +1426,13 @@ impl WgpuRenderer {
                 continue;
             }
 
+            {
+                let instance_upload = self.instance_upload.borrow();
+                if !instance_upload.is_empty() {
+                    self.queue
+                        .write_buffer(&self.instance_buffer, 0, &instance_upload);
+                }
+            }
             self.queue.submit(std::iter::once(encoder.finish()));
             frame.present();
             return;
@@ -1684,7 +1696,9 @@ impl WgpuRenderer {
             return None;
         }
         if !data.is_empty() {
-            self.queue.write_buffer(&self.instance_buffer, offset, data);
+            let mut instance_upload = self.instance_upload.borrow_mut();
+            instance_upload.resize(offset as usize, 0);
+            instance_upload.extend_from_slice(data);
         }
         *instance_offset = offset + size;
         Some((offset, NonZeroU64::new(size).expect("size is at least 16")))
