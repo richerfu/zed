@@ -2,11 +2,13 @@ use super::{wgpu_atlas::WgpuAtlas, wgpu_context::WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, Underline,
+    get_gamma_correction_ratios,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use std::cell::RefCell;
 use std::num::NonZeroU64;
+use std::ops::Range;
 use std::sync::Arc;
 
 #[repr(C)]
@@ -78,6 +80,21 @@ struct WgpuBindGroupLayouts {
     textures: wgpu::BindGroupLayout,
 }
 
+#[derive(Clone, Copy)]
+struct InstanceBinding {
+    offset: u64,
+    stride: u64,
+}
+
+struct SceneInstanceBindings {
+    quads: InstanceBinding,
+    shadows: InstanceBinding,
+    underlines: InstanceBinding,
+    monochrome_sprites: InstanceBinding,
+    subpixel_sprites: InstanceBinding,
+    polychrome_sprites: InstanceBinding,
+}
+
 pub struct WgpuRenderer {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -92,6 +109,7 @@ pub struct WgpuRenderer {
     gamma_offset: u64,
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
+    path_texture_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
     instance_buffer_capacity: u64,
     instance_buffer_alignment: u64,
@@ -101,6 +119,8 @@ pub struct WgpuRenderer {
     path_msaa_view: Option<wgpu::TextureView>,
     rendering_params: RenderingParameters,
     adapter_info: wgpu::AdapterInfo,
+    path_vertices: RefCell<Vec<PathRasterizationVertex>>,
+    path_sprites: RefCell<Vec<PathSprite>>,
 }
 
 impl WgpuRenderer {
@@ -213,13 +233,18 @@ impl WgpuRenderer {
             dual_source_blending,
         );
 
-        let atlas = Arc::new(WgpuAtlas::new(Arc::clone(&device), Arc::clone(&queue)));
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let atlas = Arc::new(WgpuAtlas::new(
+            Arc::clone(&device),
+            Arc::clone(&queue),
+            bind_group_layouts.textures.clone(),
+            atlas_sampler.clone(),
+        ));
 
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
@@ -306,9 +331,16 @@ impl WgpuRenderer {
             ],
         });
 
+        let path_texture_bind_group = Self::create_texture_bind_group(
+            &device,
+            &bind_group_layouts.textures,
+            &atlas_sampler,
+            &path_intermediate_view,
+        );
+
         let adapter_info = context.adapter.get_info();
 
-        Ok(Self {
+        let renderer = Self {
             device,
             queue,
             surface,
@@ -322,6 +354,7 @@ impl WgpuRenderer {
             gamma_offset,
             globals_bind_group,
             path_globals_bind_group,
+            path_texture_bind_group,
             instance_buffer,
             instance_buffer_capacity: initial_instance_buffer_capacity,
             instance_buffer_alignment,
@@ -331,6 +364,32 @@ impl WgpuRenderer {
             path_msaa_view,
             rendering_params,
             adapter_info,
+            path_vertices: RefCell::new(Vec::new()),
+            path_sprites: RefCell::new(Vec::new()),
+        };
+        renderer.write_global_params(true);
+        Ok(renderer)
+    }
+
+    fn create_texture_bind_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        texture_view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("texture_bind_group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
         })
     }
 
@@ -1104,6 +1163,12 @@ impl WgpuRenderer {
                 );
             self.path_intermediate_texture = path_intermediate_texture;
             self.path_intermediate_view = path_intermediate_view;
+            self.path_texture_bind_group = Self::create_texture_bind_group(
+                &self.device,
+                &self.bind_group_layouts.textures,
+                &self.atlas_sampler,
+                &self.path_intermediate_view,
+            );
 
             let (path_msaa_texture, path_msaa_view) = Self::create_msaa_if_needed(
                 &self.device,
@@ -1116,6 +1181,50 @@ impl WgpuRenderer {
             .unwrap_or((None, None));
             self.path_msaa_texture = path_msaa_texture;
             self.path_msaa_view = path_msaa_view;
+            self.write_global_params(false);
+        }
+    }
+
+    fn write_global_params(&self, include_gamma: bool) {
+        let globals = GlobalParams {
+            viewport_size: [
+                self.surface_config.width as f32,
+                self.surface_config.height as f32,
+            ],
+            premultiplied_alpha: if self.surface_config.alpha_mode
+                == wgpu::CompositeAlphaMode::PreMultiplied
+            {
+                1
+            } else {
+                0
+            },
+            pad: 0,
+        };
+        let path_globals = GlobalParams {
+            premultiplied_alpha: 0,
+            ..globals
+        };
+
+        self.queue
+            .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
+        self.queue.write_buffer(
+            &self.globals_buffer,
+            self.path_globals_offset,
+            bytemuck::bytes_of(&path_globals),
+        );
+
+        if include_gamma {
+            let gamma_params = GammaParams {
+                gamma_ratios: self.rendering_params.gamma_ratios,
+                grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
+                subpixel_enhanced_contrast: self.rendering_params.subpixel_enhanced_contrast,
+                _pad: [0.0; 2],
+            };
+            self.queue.write_buffer(
+                &self.globals_buffer,
+                self.gamma_offset,
+                bytemuck::bytes_of(&gamma_params),
+            );
         }
     }
 
@@ -1166,48 +1275,21 @@ impl WgpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let gamma_params = GammaParams {
-            gamma_ratios: self.rendering_params.gamma_ratios,
-            grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
-            subpixel_enhanced_contrast: self.rendering_params.subpixel_enhanced_contrast,
-            _pad: [0.0; 2],
-        };
-
-        let globals = GlobalParams {
-            viewport_size: [
-                self.surface_config.width as f32,
-                self.surface_config.height as f32,
-            ],
-            premultiplied_alpha: if self.surface_config.alpha_mode
-                == wgpu::CompositeAlphaMode::PreMultiplied
-            {
-                1
-            } else {
-                0
-            },
-            pad: 0,
-        };
-
-        let path_globals = GlobalParams {
-            premultiplied_alpha: 0,
-            ..globals
-        };
-
-        self.queue
-            .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
-        self.queue.write_buffer(
-            &self.globals_buffer,
-            self.path_globals_offset,
-            bytemuck::bytes_of(&path_globals),
-        );
-        self.queue.write_buffer(
-            &self.globals_buffer,
-            self.gamma_offset,
-            bytemuck::bytes_of(&gamma_params),
-        );
-
         loop {
             let mut instance_offset: u64 = 0;
+            let Some(instance_bindings) = self.write_scene_instances(scene, &mut instance_offset)
+            else {
+                if self.instance_buffer_capacity >= 256 * 1024 * 1024 {
+                    log::error!(
+                        "instance buffer size grew too large: {}",
+                        self.instance_buffer_capacity
+                    );
+                    frame.present();
+                    return;
+                }
+                self.grow_instance_buffer();
+                continue;
+            };
             let mut overflow = false;
 
             let mut encoder = self
@@ -1234,12 +1316,16 @@ impl WgpuRenderer {
 
                 for batch in scene.batches() {
                     let ok = match batch {
-                        PrimitiveBatch::Quads(range) => {
-                            self.draw_quads(&scene.quads[range], &mut instance_offset, &mut pass)
-                        }
-                        PrimitiveBatch::Shadows(range) => self.draw_shadows(
-                            &scene.shadows[range],
-                            &mut instance_offset,
+                        PrimitiveBatch::Quads(range) => self.draw_instances(
+                            range,
+                            instance_bindings.quads,
+                            &self.pipelines.quads,
+                            &mut pass,
+                        ),
+                        PrimitiveBatch::Shadows(range) => self.draw_instances(
+                            range,
+                            instance_bindings.shadows,
+                            &self.pipelines.shadows,
                             &mut pass,
                         ),
                         PrimitiveBatch::Paths(range) => {
@@ -1281,30 +1367,31 @@ impl WgpuRenderer {
                                 false
                             }
                         }
-                        PrimitiveBatch::Underlines(range) => self.draw_underlines(
-                            &scene.underlines[range],
-                            &mut instance_offset,
+                        PrimitiveBatch::Underlines(range) => self.draw_instances(
+                            range,
+                            instance_bindings.underlines,
+                            &self.pipelines.underlines,
                             &mut pass,
                         ),
                         PrimitiveBatch::MonochromeSprites { texture_id, range } => self
                             .draw_monochrome_sprites(
-                                &scene.monochrome_sprites[range],
+                                range,
                                 texture_id,
-                                &mut instance_offset,
+                                instance_bindings.monochrome_sprites,
                                 &mut pass,
                             ),
                         PrimitiveBatch::SubpixelSprites { texture_id, range } => self
                             .draw_subpixel_sprites(
-                                &scene.subpixel_sprites[range],
+                                range,
                                 texture_id,
-                                &mut instance_offset,
+                                instance_bindings.subpixel_sprites,
                                 &mut pass,
                             ),
                         PrimitiveBatch::PolychromeSprites { texture_id, range } => self
                             .draw_polychrome_sprites(
-                                &scene.polychrome_sprites[range],
+                                range,
                                 texture_id,
-                                &mut instance_offset,
+                                instance_bindings.polychrome_sprites,
                                 &mut pass,
                             ),
                         PrimitiveBatch::Surfaces(_surfaces) => {
@@ -1340,172 +1427,127 @@ impl WgpuRenderer {
         }
     }
 
-    fn draw_quads(
-        &self,
-        quads: &[Quad],
-        instance_offset: &mut u64,
-        pass: &mut wgpu::RenderPass<'_>,
-    ) -> bool {
-        let data = unsafe { Self::instance_bytes(quads) };
-        self.draw_instances(
-            data,
-            quads.len() as u32,
-            &self.pipelines.quads,
-            instance_offset,
-            pass,
-        )
-    }
-
-    fn draw_shadows(
-        &self,
-        shadows: &[Shadow],
-        instance_offset: &mut u64,
-        pass: &mut wgpu::RenderPass<'_>,
-    ) -> bool {
-        let data = unsafe { Self::instance_bytes(shadows) };
-        self.draw_instances(
-            data,
-            shadows.len() as u32,
-            &self.pipelines.shadows,
-            instance_offset,
-            pass,
-        )
-    }
-
-    fn draw_underlines(
-        &self,
-        underlines: &[Underline],
-        instance_offset: &mut u64,
-        pass: &mut wgpu::RenderPass<'_>,
-    ) -> bool {
-        let data = unsafe { Self::instance_bytes(underlines) };
-        self.draw_instances(
-            data,
-            underlines.len() as u32,
-            &self.pipelines.underlines,
-            instance_offset,
-            pass,
-        )
-    }
-
     fn draw_monochrome_sprites(
         &self,
-        sprites: &[MonochromeSprite],
+        range: Range<usize>,
         texture_id: AtlasTextureId,
-        instance_offset: &mut u64,
+        binding: InstanceBinding,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
         let tex_info = self.atlas.get_texture_info(texture_id);
-        let data = unsafe { Self::instance_bytes(sprites) };
         self.draw_instances_with_texture(
-            data,
-            sprites.len() as u32,
-            &tex_info.view,
+            range,
+            binding,
+            &tex_info.bind_group,
             &self.pipelines.mono_sprites,
-            instance_offset,
             pass,
         )
     }
 
     fn draw_subpixel_sprites(
         &self,
-        sprites: &[SubpixelSprite],
+        range: Range<usize>,
         texture_id: AtlasTextureId,
-        instance_offset: &mut u64,
+        binding: InstanceBinding,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
         let tex_info = self.atlas.get_texture_info(texture_id);
-        let data = unsafe { Self::instance_bytes(sprites) };
         let pipeline = self
             .pipelines
             .subpixel_sprites
             .as_ref()
             .unwrap_or(&self.pipelines.mono_sprites);
-        self.draw_instances_with_texture(
-            data,
-            sprites.len() as u32,
-            &tex_info.view,
-            pipeline,
-            instance_offset,
-            pass,
-        )
+        self.draw_instances_with_texture(range, binding, &tex_info.bind_group, pipeline, pass)
     }
 
     fn draw_polychrome_sprites(
         &self,
-        sprites: &[PolychromeSprite],
+        range: Range<usize>,
         texture_id: AtlasTextureId,
-        instance_offset: &mut u64,
+        binding: InstanceBinding,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
         let tex_info = self.atlas.get_texture_info(texture_id);
-        let data = unsafe { Self::instance_bytes(sprites) };
         self.draw_instances_with_texture(
-            data,
-            sprites.len() as u32,
-            &tex_info.view,
+            range,
+            binding,
+            &tex_info.bind_group,
             &self.pipelines.poly_sprites,
-            instance_offset,
             pass,
         )
     }
 
     fn draw_instances(
         &self,
-        data: &[u8],
-        instance_count: u32,
+        range: Range<usize>,
+        binding: InstanceBinding,
         pipeline: &wgpu::RenderPipeline,
-        instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
+        let instance_count = range.len() as u32;
         if instance_count == 0 {
             return true;
         }
-        let Some((offset, size)) = self.write_to_instance_buffer(instance_offset, data) else {
-            return false;
-        };
+        let offset = binding.offset + range.start as u64 * binding.stride;
+        let size = range.len() as u64 * binding.stride;
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.globals_bind_group, &[]);
-        pass.set_vertex_buffer(0, self.instance_buffer.slice(offset..offset + size.get()));
+        pass.set_vertex_buffer(0, self.instance_buffer.slice(offset..offset + size));
         pass.draw(0..4, 0..instance_count);
         true
     }
 
     fn draw_instances_with_texture(
         &self,
-        data: &[u8],
-        instance_count: u32,
-        texture_view: &wgpu::TextureView,
+        range: Range<usize>,
+        binding: InstanceBinding,
+        texture_bind_group: &wgpu::BindGroup,
         pipeline: &wgpu::RenderPipeline,
-        instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
+        let instance_count = range.len() as u32;
         if instance_count == 0 {
             return true;
         }
-        let Some((offset, size)) = self.write_to_instance_buffer(instance_offset, data) else {
-            return false;
-        };
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.bind_group_layouts.textures,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
-                },
-            ],
-        });
+        let offset = binding.offset + range.start as u64 * binding.stride;
+        let size = range.len() as u64 * binding.stride;
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.globals_bind_group, &[]);
-        pass.set_bind_group(1, &bind_group, &[]);
-        pass.set_vertex_buffer(0, self.instance_buffer.slice(offset..offset + size.get()));
+        pass.set_bind_group(1, texture_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.instance_buffer.slice(offset..offset + size));
         pass.draw(0..4, 0..instance_count);
         true
+    }
+
+    fn write_scene_instances(
+        &self,
+        scene: &Scene,
+        instance_offset: &mut u64,
+    ) -> Option<SceneInstanceBindings> {
+        Some(SceneInstanceBindings {
+            quads: self.write_instance_binding(&scene.quads, instance_offset)?,
+            shadows: self.write_instance_binding(&scene.shadows, instance_offset)?,
+            underlines: self.write_instance_binding(&scene.underlines, instance_offset)?,
+            monochrome_sprites: self
+                .write_instance_binding(&scene.monochrome_sprites, instance_offset)?,
+            subpixel_sprites: self
+                .write_instance_binding(&scene.subpixel_sprites, instance_offset)?,
+            polychrome_sprites: self
+                .write_instance_binding(&scene.polychrome_sprites, instance_offset)?,
+        })
+    }
+
+    fn write_instance_binding<T>(
+        &self,
+        instances: &[T],
+        instance_offset: &mut u64,
+    ) -> Option<InstanceBinding> {
+        let data = unsafe { Self::instance_bytes(instances) };
+        let (offset, _) = self.write_to_instance_buffer(instance_offset, data)?;
+        Some(InstanceBinding {
+            offset,
+            stride: std::mem::size_of::<T>() as u64,
+        })
     }
 
     unsafe fn instance_bytes<T>(instances: &[T]) -> &[u8] {
@@ -1524,29 +1566,33 @@ impl WgpuRenderer {
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
         let first_path = &paths[0];
-        let sprites: Vec<PathSprite> = if paths.last().map(|p| &p.order) == Some(&first_path.order)
-        {
-            paths
-                .iter()
-                .map(|p| PathSprite {
-                    bounds: p.clipped_bounds(),
-                })
-                .collect()
+        let mut sprites = self.path_sprites.borrow_mut();
+        sprites.clear();
+        if paths.last().map(|p| &p.order) == Some(&first_path.order) {
+            sprites.extend(paths.iter().map(|p| PathSprite {
+                bounds: p.clipped_bounds(),
+            }));
         } else {
             let mut bounds = first_path.clipped_bounds();
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            vec![PathSprite { bounds }]
-        };
+            sprites.push(PathSprite { bounds });
+        }
 
-        let sprite_data = unsafe { Self::instance_bytes(&sprites) };
+        let sprite_data = unsafe { Self::instance_bytes(sprites.as_slice()) };
+        let Some((offset, _)) = self.write_to_instance_buffer(instance_offset, sprite_data) else {
+            return false;
+        };
+        let sprite_count = sprites.len();
         self.draw_instances_with_texture(
-            sprite_data,
-            sprites.len() as u32,
-            &self.path_intermediate_view,
+            0..sprite_count,
+            InstanceBinding {
+                offset,
+                stride: std::mem::size_of::<PathSprite>() as u64,
+            },
+            &self.path_texture_bind_group,
             &self.pipelines.paths,
-            instance_offset,
             pass,
         )
     }
@@ -1557,7 +1603,8 @@ impl WgpuRenderer {
         paths: &[Path<ScaledPixels>],
         instance_offset: &mut u64,
     ) -> bool {
-        let mut vertices = Vec::new();
+        let mut vertices = self.path_vertices.borrow_mut();
+        vertices.clear();
         for path in paths {
             let bounds = path.clipped_bounds();
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
@@ -1572,7 +1619,7 @@ impl WgpuRenderer {
             return true;
         }
 
-        let vertex_data = unsafe { Self::instance_bytes(&vertices) };
+        let vertex_data = unsafe { Self::instance_bytes(vertices.as_slice()) };
         let Some((vertex_offset, vertex_size)) =
             self.write_to_instance_buffer(instance_offset, vertex_data)
         else {
@@ -1636,7 +1683,9 @@ impl WgpuRenderer {
         if offset + size > self.instance_buffer_capacity {
             return None;
         }
-        self.queue.write_buffer(&self.instance_buffer, offset, data);
+        if !data.is_empty() {
+            self.queue.write_buffer(&self.instance_buffer, offset, data);
+        }
         *instance_offset = offset + size;
         Some((offset, NonZeroU64::new(size).expect("size is at least 16")))
     }
